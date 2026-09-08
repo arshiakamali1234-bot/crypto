@@ -176,16 +176,12 @@ function quickTrendSnapshot(candles){
 // تایم‌فریم‌های استاندارد برای تحلیل بالا-به-پایین (Top-Down) — ترتیب اهمیت: 1D → 4H → 1H → 15M → 5M
 const MTF_STACK = ['1d','4h','1h','15m','5m'];
 async function buildMultiTimeframeSnapshot(symbol){
-  const snapshot = {};
-  for(const tf of MTF_STACK){
-    try{
-      const candles = await fetchKlines(symbol, tf, 150);
-      snapshot[tf] = quickTrendSnapshot(candles);
-    }catch(e){
-      snapshot[tf] = { available:false };
-    }
-  }
-  return snapshot;
+  const snapshot={};
+  const results=await Promise.all(MTF_STACK.map(async tf=>{
+    try{ const candles=await fetchKlines(symbol,tf,180); const q=quickTrendSnapshot(candles); return [tf,{...q,ichimoku:ichimoku(candles),advancedStructure:advancedStructure(candles,atr(candles,14))}]; }
+    catch(e){ return [tf,{available:false,error:e.message}]; }
+  }));
+  results.forEach(([tf,v])=>snapshot[tf]=v); return snapshot;
 }
 
 // ---------- ابزارهای ریاضی ----------
@@ -633,255 +629,271 @@ function detectPatterns(candles){
 }
 
 // ---------- امتیازدهی و نتیجه‌گیری نهایی ----------
+/* =========================================================
+   ANALYSIS ENGINE V2 — ساختارمحور، چندتایم‌فریمی، ضد نویز
+   هدف: کیفیت ستاپ > تعداد سیگنال
+   ========================================================= */
+function clamp(v,a=0,b=100){ return Math.max(a,Math.min(b,v)); }
+function safeNum(v,f=0){ return Number.isFinite(+v) ? +v : f; }
+function pctDistance(a,b){ return b ? Math.abs(a-b)/Math.abs(b)*100 : Infinity; }
+function signDir(v){ return v>0 ? 'up' : v<0 ? 'down' : 'neutral'; }
+
+function ichimoku(candles){
+  const n=candles.length;
+  if(n<60) return null;
+  const mid=(arr)=> (Math.max(...arr.map(c=>c.high))+Math.min(...arr.map(c=>c.low)))/2;
+  const tenkan=mid(candles.slice(-9));
+  const kijun=mid(candles.slice(-26));
+  const spanB=mid(candles.slice(-52));
+  const spanA=(tenkan+kijun)/2;
+  const pastKijun = n>=27 ? mid(candles.slice(-27,-1)) : kijun;
+  const prevTenkan = n>=10 ? mid(candles.slice(-10,-1)) : tenkan;
+  const prevKijun = n>=27 ? mid(candles.slice(-27,-1)) : kijun;
+  const cloudTop=Math.max(spanA,spanB), cloudBottom=Math.min(spanA,spanB);
+  const close=candles.at(-1).close;
+  const atrVal=atr(candles,14)||Math.max(close*0.005,1e-9);
+  const cloudThickness=(cloudTop-cloudBottom)/atrVal;
+  const tkCross = tenkan>kijun && prevTenkan<=prevKijun ? 'bullish' : tenkan<kijun && prevTenkan>=prevKijun ? 'bearish' : 'none';
+  const priceVsCloud=close>cloudTop?'above':close<cloudBottom?'below':'inside';
+  // Chikou is current close compared with price/cloud 26 periods back.
+  const ref=n>=27 ? candles[n-27] : null;
+  const chikou=close;
+  const chikouVsPrice=ref ? (chikou>ref.close?'above':chikou<ref.close?'below':'inside') : 'unknown';
+  const bullishFuture=spanA>spanB;
+  let score=0;
+  score += priceVsCloud==='above'?3:priceVsCloud==='below'?-3:0;
+  score += tenkan>kijun?2:tenkan<kijun?-2:0;
+  score += kijun>=pastKijun?1:-1;
+  score += bullishFuture?2:-2;
+  score += cloudThickness>0.8?1:0;
+  score += chikouVsPrice==='above'?2:chikouVsPrice==='below'?-2:0;
+  score += tkCross==='bullish'?1:tkCross==='bearish'?-1:0;
+  return {tenkan,kijun,senkouA:spanA,senkouB:spanB,cloudTop,cloudBottom,cloudThickness,
+    priceVsCloud,bullishFuture,chikou,chikouVsPrice,tkCross,score:clamp(50+score*5)};
+}
+
+function volumeProfileLite(candles,bins=24,lookback=120){
+  const win=candles.slice(-lookback); if(win.length<20) return null;
+  const lo=Math.min(...win.map(c=>c.low)), hi=Math.max(...win.map(c=>c.high));
+  const step=(hi-lo)/(bins||1); if(step<=0) return null;
+  const vol=Array(bins).fill(0);
+  win.forEach(c=>{ const tp=(c.high+c.low+c.close)/3; const idx=Math.max(0,Math.min(bins-1,Math.floor((tp-lo)/step))); vol[idx]+=c.volume; });
+  let maxI=0; vol.forEach((v,i)=>{if(v>vol[maxI])maxI=i;});
+  const poc=lo+(maxI+0.5)*step;
+  const total=vol.reduce((a,b)=>a+b,0), target=total*0.70;
+  let cum=vol[maxI], l=maxI, r=maxI;
+  while(cum<target && (l>0||r<bins-1)){ const lv=l>0?vol[l-1]:-1, rv=r<bins-1?vol[r+1]:-1; if(rv>=lv){r++;cum+=vol[r];}else{l--;cum+=vol[l];} }
+  return {poc, valueAreaLow:lo+l*step, valueAreaHigh:lo+(r+1)*step, totalVolume:total};
+}
+
+function volumeMetrics(candles){
+  const vols=candles.map(c=>c.volume), last=vols.at(-1), avg=sma(vols.slice(-20),20);
+  const prevAvg=sma(vols.slice(-40,-20),20)||avg;
+  const ratio=avg?last/avg:1;
+  const trend=prevAvg?avg/prevAvg:1;
+  const obv=[]; let o=0;
+  for(let i=1;i<candles.length;i++){ if(candles[i].close>candles[i-1].close)o+=candles[i].volume; else if(candles[i].close<candles[i-1].close)o-=candles[i].volume; obv.push(o); }
+  const obvSlope=obv.length>=10 ? obv.at(-1)-obv.at(-10) : 0;
+  return {last,avg,ratio,trend,obvSlope,expanding:ratio>=1.25,contracting:ratio<=0.75};
+}
+
+function advancedStructure(candles, atrVal){
+  const pts=[]; const lb=3;
+  for(let i=lb;i<candles.length-lb;i++){
+    const win=candles.slice(i-lb,i+lb+1), c=candles[i];
+    if(c.high===Math.max(...win.map(x=>x.high))) pts.push({i,price:c.high,type:'H'});
+    if(c.low===Math.min(...win.map(x=>x.low))) pts.push({i,price:c.low,type:'L'});
+  }
+  const piv=[]; for(const p of pts){const last=piv.at(-1); if(!last){piv.push(p);continue;} if(last.type===p.type){ if(p.type==='H'&&p.price>=last.price)piv[piv.length-1]=p; if(p.type==='L'&&p.price<=last.price)piv[piv.length-1]=p; } else piv.push(p);}
+  const hs=piv.filter(p=>p.type==='H').slice(-4), ls=piv.filter(p=>p.type==='L').slice(-4);
+  let hh=0,hl=0,lh=0,ll=0;
+  if(hs.length>=2){hh=hs.at(-1).price>hs.at(-2).price?1:0;lh=hs.at(-1).price<hs.at(-2).price?1:0;}
+  if(ls.length>=2){hl=ls.at(-1).price>ls.at(-2).price?1:0;ll=ls.at(-1).price<ls.at(-2).price?1:0;}
+  let structure='رنج/انتقالی';
+  if(hh&&hl)structure='صعودی (HH+HL)'; else if(lh&&ll)structure='نزولی (LH+LL)';
+  const close=candles.at(-1).close, lastH=hs.at(-1)?.price, lastL=ls.at(-1)?.price;
+  const buffer=(atrVal||close*0.005)*0.15;
+  let event=null;
+  if(lastH && close>lastH+buffer) event=structure.startsWith('صعودی')?'BOS صعودی':'CHoCH صعودی';
+  else if(lastL && close<lastL-buffer) event=structure.startsWith('نزولی')?'BOS نزولی':'CHoCH نزولی';
+  return {structure,event,hh:!!hh,hl:!!hl,lh:!!lh,ll:!!ll,pivots:piv.slice(-8),lastSwingHigh:lastH,lastSwingLow:lastL};
+}
+
+function detectClassicalPatterns(candles, structure){
+  const out=[]; const hs=structure.pivots.filter(p=>p.type==='H').slice(-4), ls=structure.pivots.filter(p=>p.type==='L').slice(-4);
+  const tol=0.012;
+  if(hs.length>=2){
+    const a=hs.at(-2),b=hs.at(-1); const between=ls.filter(x=>x.i>a.i&&x.i<b.i);
+    if(Math.abs(a.price-b.price)/((a.price+b.price)/2)<tol && between.length){
+      const neckline=Math.min(...between.map(x=>x.price));
+      out.push({name:'Double Top',dir:'down',status:candles.at(-1).close<neckline?'CONFIRMED':'FORMING',neckline});
+    }
+  }
+  if(ls.length>=2){
+    const a=ls.at(-2),b=ls.at(-1); const between=hs.filter(x=>x.i>a.i&&x.i<b.i);
+    if(Math.abs(a.price-b.price)/((a.price+b.price)/2)<tol && between.length){
+      const neckline=Math.max(...between.map(x=>x.price));
+      out.push({name:'Double Bottom',dir:'up',status:candles.at(-1).close>neckline?'CONFIRMED':'FORMING',neckline});
+    }
+  }
+  if(hs.length>=3){
+    const [a,b,c]=hs.slice(-3); if(b.price>a.price*(1+tol*.5)&&b.price>c.price*(1+tol*.5)&&Math.abs(a.price-c.price)/((a.price+c.price)/2)<tol){
+      const mids=ls.filter(x=>x.i>a.i&&x.i<c.i); if(mids.length>=2){const neckline=(mids.at(-1).price+mids.at(-2).price)/2; out.push({name:'Head & Shoulders',dir:'down',status:candles.at(-1).close<neckline?'CONFIRMED':'FORMING',neckline});}
+    }
+  }
+  if(ls.length>=3){ const [a,b,c]=ls.slice(-3); if(b.price<a.price*(1-tol*.5)&&b.price<c.price*(1-tol*.5)&&Math.abs(a.price-c.price)/((a.price+c.price)/2)<tol){
+      const mids=hs.filter(x=>x.i>a.i&&x.i<c.i); if(mids.length>=2){const neckline=(mids.at(-1).price+mids.at(-2).price)/2; out.push({name:'Inverse Head & Shoulders',dir:'up',status:candles.at(-1).close>neckline?'CONFIRMED':'FORMING',neckline});}
+    }}
+  return out;
+}
+
+function wavePressureV2(candles,atrVal,pattern,structure,vol){
+  const piv=structure?.pivots||[]; if(piv.length<4||!atrVal)return null;
+  const waves=[]; for(let i=1;i<piv.length;i++){
+    const a=piv[i-1],b=piv[i], dur=Math.max(1,b.i-a.i), disp=b.price-a.price;
+    waves.push({dir:disp>0?'up':'down',dispPct:disp/a.price*100,duration,eff:Math.abs(disp)/(atrVal*dur)});
+  }
+  const last=waves.at(-1); const ups=waves.filter(w=>w.dir==='up'), downs=waves.filter(w=>w.dir==='down');
+  const avg=x=>x.length?x.reduce((a,b)=>a+b.eff,0)/x.length:0;
+  const upEff=avg(ups), downEff=avg(downs);
+  const expansion=waves.length>=3 ? Math.abs(waves.at(-1).dispPct)>Math.abs(waves.at(-2).dispPct) : false;
+  const pullback=last?.dir==='up' ? downs : ups;
+  const pullWeak=pullback.length>=2 && pullback.at(-1).eff<pullback.at(-2).eff;
+  let bull=50 + clamp((upEff-downEff)*18,-25,25) + (last?.dir==='up'?7:-7) + (pullWeak&&last?.dir==='up'?8:0) + (expansion&&last?.dir==='up'?6:0);
+  let bear=50 + clamp((downEff-upEff)*18,-25,25) + (last?.dir==='down'?7:-7) + (pullWeak&&last?.dir==='down'?8:0) + (expansion&&last?.dir==='down'?6:0);
+  if(pattern?.breakout==='up') bull+=10; if(pattern?.breakout==='down') bear+=10;
+  if(vol?.expanding && last){ if(last.dir==='up')bull+=6; else bear+=6; }
+  bull=clamp(Math.round(bull)); bear=clamp(Math.round(bear));
+  return {waves:waves.slice(-5),bullishPressure:bull,bearishPressure:bear,
+    overall:Math.abs(bull-bear)<10?'متعادل (BALANCED PRESSURE)':bull>bear?'فشار صعودی غالب (BULLISH PRESSURE)':'فشار نزولی غالب (BEARISH PRESSURE)',
+    upAcceleration:ups.length>=2?(ups.at(-1).eff>ups.at(-2).eff*1.1?'Accelerating':ups.at(-1).eff<ups.at(-2).eff*.9?'Decelerating':'Stable'):'داده ناکافی',
+    downAcceleration:downs.length>=2?(downs.at(-1).eff>downs.at(-2).eff*1.1?'Accelerating':downs.at(-1).eff<downs.at(-2).eff*.9?'Decelerating':'Stable'):'داده ناکافی',
+    pivotExpansion:expansion,pullbackWeakening:pullWeak};
+}
+
+function weightedAnalysisScore(parts){
+  const weights={structure:20,trend:15,ichimoku:12,sr:10,volume:10,priceAction:8,wave:8,pattern:6,momentum:5,smc:4,fib:2};
+  let directional=0,total=0;
+  for(const k of Object.keys(weights)){ const v=clamp(parts[k]??0,-1,1); directional+=v*weights[k]; total+=weights[k]; }
+  return {directional:+directional.toFixed(2),quality:clamp(Math.round(50+directional/2),0,100),weights};
+}
+
+function buildProfessionalPlan(dir,entry,atrVal,supports,resistances,quality,triggered=false){
+  if(!entry||!atrVal)return null;
+  const sup=supports?.filter(x=>x.price<entry).sort((a,b)=>b.price-a.price)[0]?.price;
+  const res=resistances?.filter(x=>x.price>entry).sort((a,b)=>a.price-b.price)[0]?.price;
+  const buffer=atrVal*0.20;
+  let stop=dir==='LONG' ? Math.min(entry-atrVal*1.5,sup?sup-buffer:entry-atrVal*1.5) : Math.max(entry+atrVal*1.5,res?res+buffer:entry+atrVal*1.5);
+  if((dir==='LONG'&&stop>=entry)||(dir==='SHORT'&&stop<=entry))return null;
+  const risk=Math.abs(entry-stop);
+  const tp1=entry+(dir==='LONG'?1:-1)*risk*1.5, tp2=entry+(dir==='LONG'?1:-1)*risk*2.5;
+  const structural=dir==='LONG' ? resistances?.find(x=>x.price>tp2)?.price : supports?.slice().reverse().find(x=>x.price<tp2)?.price;
+  const tp3=structural ?? entry+(dir==='LONG'?1:-1)*risk*4;
+  return {direction:dir,active:triggered,entry,stopLoss:stop,takeProfit1:tp1,takeProfit2:tp2,takeProfit3:tp3,
+    riskRewardTP1:1.5,riskRewardTP2:2.5,riskRewardTP3:+(Math.abs(tp3-entry)/risk).toFixed(2),
+    state:triggered?5:3,entryState:triggered?'ENTRY VALID':'TRIGGER FORMED',quality};
+}
+
 function analyze(candles, htfCandles){
-  if(candles.length < 60){
-    return { insufficient:true };
-  }
-  const closes = candles.map(c=>c.close);
-  const volumes = candles.map(c=>c.volume);
-  const lastClose = closes.at(-1);
+  if(!candles || candles.length<100) return {insufficient:true};
+  const closes=candles.map(c=>c.close), volumes=candles.map(c=>c.volume), lastClose=closes.at(-1);
+  const ema20=emaSeries(closes,20).at(-1), ema50=emaSeries(closes,50).at(-1), ema200=closes.length>=200?emaSeries(closes,200).at(-1):null;
+  const rsiVal=rsi(closes,14), macdVal=macd(closes), atrVal=atr(candles,14), bb=bollinger(closes,20,2), stoch=stochastic(candles,14,3), adxVal=adx(candles,14);
+  const divergence=detectRSIDivergence(candles,closes), fib=fibonacci(candles,80), vwapVal=vwap(candles.slice(-200));
+  const structure=advancedStructure(candles,atrVal), legacyStructure=marketStructure(candles), ich=ichimoku(candles);
+  const volume=volumeMetrics(candles), vp=volumeProfileLite(candles), liquidity=findLiquidityPools(candles,60,0.1), orderBlock=findOrderBlock(candles,atrVal), fvgs=findFVGs(candles,40);
+  const chartPattern=detectChartPatterns(candles), classicalPatterns=detectClassicalPatterns(candles,structure);
+  const patterns=[...detectPatterns(candles),...classicalPatterns.map(p=>({name:p.name+' — '+p.status,dir:p.dir}))];
+  const waveEngine=wavePressureV2(candles,atrVal,chartPattern,structure,volume);
+  const {highs,lows}=findSwingPoints(candles,3);
+  const resistances=clusterLevels(highs.filter(x=>x>lastClose),0.15).sort((a,b)=>a.price-b.price).slice(0,4);
+  const supports=clusterLevels(lows.filter(x=>x<lastClose),0.15).sort((a,b)=>b.price-a.price).slice(0,4);
+  const htfTrend=htfCandles&&htfCandles.length>=80 ? (()=>{const hc=htfCandles.map(c=>c.close),e20=emaSeries(hc,20).at(-1),e50=emaSeries(hc,50).at(-1),l=hc.at(-1);return l>e20&&e20>e50?'up':l<e20&&e20<e50?'down':'mixed';})() : null;
+  const nearestRes=resistances[0]?.price, nearestSup=supports[0]?.price;
 
-  const ema20 = emaSeries(closes,20).at(-1);
-  const ema50 = emaSeries(closes,50).at(-1);
-  const ema200 = closes.length>=200 ? emaSeries(closes,200).at(-1) : null;
-  const rsiVal = rsi(closes,14);
-  const macdVal = macd(closes);
-  const atrVal = atr(candles,14);
-  const bb = bollinger(closes,20,2);
-  const stoch = stochastic(candles,14,3);
-  const adxVal = adx(candles,14);
-  const divergence = detectRSIDivergence(candles, closes);
-  const fib = fibonacci(candles, 80);
-  const vwapVal = vwap(candles.slice(-Math.min(candles.length,200)));
-  const structure = marketStructure(candles);
-  const orderBlock = findOrderBlock(candles, atrVal);
-  const fvgs = findFVGs(candles, 40);
-  const liquidity = findLiquidityPools(candles, 60, 0.1);
+  // هر جزء ابتدا به بازه -1..+1 نرمال می‌شود؛ اندیکاتورهای کم‌ارزش عمداً وزن پایین دارند.
+  const trendRaw=ema200 ? (lastClose>ema20&&ema20>ema50&&ema50>ema200?1:lastClose<ema20&&ema20<ema50&&ema50<ema200?-1:lastClose>ema50?.45:-.45) : (lastClose>ema50?.35:-.35);
+  let structureRaw=structure.structure.startsWith('صعودی')?0.75:structure.structure.startsWith('نزولی')?-0.75:0;
+  if(structure.event?.includes('صعودی'))structureRaw=Math.max(structureRaw,.95); if(structure.event?.includes('نزولی'))structureRaw=Math.min(structureRaw,-.95);
+  const ichRaw=ich?clamp((ich.score-50)/50,-1,1):0;
+  const htfRaw=htfTrend==='up'?1:htfTrend==='down'?-1:0;
+  let srRaw=0; if(nearestSup && pctDistance(lastClose,nearestSup)<1)srRaw+=.45; if(nearestRes && pctDistance(lastClose,nearestRes)<1)srRaw-=.45;
+  if(lastClose>nearestRes)srRaw+=.8; if(lastClose<nearestSup)srRaw-=.8;
+  let volRaw=clamp((volume.ratio-1)*1.5,-1,1); if(lastClose<closes.at(-2))volRaw=-Math.abs(volRaw); else volRaw=Math.abs(volRaw);
+  let paRaw=0; patterns.forEach(p=>{paRaw+=p.dir==='up'?.35:p.dir==='down'?-.35:0}); paRaw=clamp(paRaw,-1,1);
+  const waveRaw=waveEngine?clamp((waveEngine.bullishPressure-waveEngine.bearishPressure)/50,-1,1):0;
+  let patRaw=chartPattern?.dirBias==='up'?.7:chartPattern?.dirBias==='down'?-.7:0;
+  if(classicalPatterns.some(p=>p.status==='CONFIRMED')) patRaw += classicalPatterns.filter(p=>p.status==='CONFIRMED').reduce((a,p)=>a+(p.dir==='up'?.25:-.25),0);
+  patRaw=clamp(patRaw,-1,1);
+  let momRaw=0; if(macdVal.hist>0)momRaw+=.35; else momRaw-=.35; if(rsiVal>55&&rsiVal<70)momRaw+=.25; if(rsiVal<45&&rsiVal>30)momRaw-=.25; if(divergence?.bullishDiv)momRaw+=.25; if(divergence?.bearishDiv)momRaw-=.25; momRaw=clamp(momRaw,-1,1);
+  let smcRaw=0; if(orderBlock)smcRaw+=orderBlock.dir==='bull'?.25:-.25; if(liquidity?.sweep)smcRaw+=liquidity.sweep.includes('صعودی')?.4:-.4; smcRaw=clamp(smcRaw,-1,1);
+  let fibRaw=0; if(fib){const near=[.5,.618,.382].some(r=>pctDistance(lastClose,fib.levels[r])<.5); if(near)fibRaw=fib.impulseUp?.5:-.5;}
 
-  // روند تایم‌فریم بالاتر (Multi-Timeframe Confirmation)
-  let htfTrend = null;
-  if(htfCandles && htfCandles.length >= 60){
-    const htfCloses = htfCandles.map(c=>c.close);
-    const hEma20 = emaSeries(htfCloses,20).at(-1);
-    const hEma50 = emaSeries(htfCloses,50).at(-1);
-    const hLast = htfCloses.at(-1);
-    htfTrend = hLast > hEma20 && hEma20 > hEma50 ? 'up' : (hLast < hEma20 && hEma20 < hEma50 ? 'down' : 'mixed');
-  }
-
-  const { highs, lows } = findSwingPoints(candles, 3);
-  const resistances = clusterLevels(highs.filter(h=>h>lastClose)).slice(0,3);
-  const supports = clusterLevels(lows.filter(l=>l<lastClose)).slice(0,3);
-
-  const patterns = detectPatterns(candles);
-  const chartPattern = detectChartPatterns(candles);
-  const waveEngine = analyzeWaveStrength(candles, atrVal);
-
-  const volAvg = sma(volumes, 20);
-  const volLast = volumes.at(-1);
-  const volRising = volLast > volAvg * 1.15;
-
-  // --- امتیازدهی confluence (هر بخش -2 تا +2) ---
-  let score = 0;
-  const notes = [];
-
-  // روند
-  let trendScore = 0;
-  if(ema200){
-    if(lastClose > ema20 && ema20 > ema50 && ema50 > ema200){ trendScore=2; notes.push('روند صعودی قوی: قیمت بالای EMA20 > EMA50 > EMA200'); }
-    else if(lastClose < ema20 && ema20 < ema50 && ema50 < ema200){ trendScore=-2; notes.push('روند نزولی قوی: قیمت زیر EMA20 < EMA50 < EMA200'); }
-    else if(lastClose > ema50){ trendScore=1; notes.push('روند میان‌مدت مثبت (بالای EMA50)'); }
-    else { trendScore=-1; notes.push('روند میان‌مدت منفی (زیر EMA50)'); }
-  } else {
-    trendScore = lastClose > ema50 ? 1 : -1;
-    notes.push('داده کافی برای EMA200 وجود ندارد؛ فقط روند کوتاه/میان‌مدت بررسی شد.');
-  }
-  score += trendScore;
-
-  // مومنتوم (RSI + MACD + Stochastic + واگرایی)
-  let momScore = 0;
-  if(rsiVal > 70){ momScore -= 1; notes.push(`RSI=${rsiVal.toFixed(1)} در ناحیه اشباع خرید`); }
-  else if(rsiVal < 30){ momScore += 1; notes.push(`RSI=${rsiVal.toFixed(1)} در ناحیه اشباع فروش`); }
-  else notes.push(`RSI=${rsiVal.toFixed(1)} خنثی`);
-  if(macdVal.hist > 0 && macdVal.hist > macdVal.prevHist){ momScore += 1; notes.push('هیستوگرام MACD مثبت و در حال افزایش (مومنتوم صعودی)'); }
-  else if(macdVal.hist < 0 && macdVal.hist < macdVal.prevHist){ momScore -= 1; notes.push('هیستوگرام MACD منفی و در حال افزایش فشار فروش'); }
-  if(stoch.k < 20 && stoch.k > stoch.d){ momScore += 1; notes.push(`Stochastic (K=${stoch.k.toFixed(1)}) از ناحیه اشباع فروش برگشته`); }
-  else if(stoch.k > 80 && stoch.k < stoch.d){ momScore -= 1; notes.push(`Stochastic (K=${stoch.k.toFixed(1)}) از ناحیه اشباع خرید برگشته`); }
-  if(divergence?.bullishDiv){ momScore += 1; notes.push('واگرایی مثبت RSI شناسایی شد (کف قیمت پایین‌تر ولی RSI بالاتر) — هشدار برگشت صعودی'); }
-  if(divergence?.bearishDiv){ momScore -= 1; notes.push('واگرایی منفی RSI شناسایی شد (سقف قیمت بالاتر ولی RSI پایین‌تر) — هشدار برگشت نزولی'); }
-  score += momScore;
-
-  // پرایس اکشن
-  let paScore = 0;
-  patterns.forEach(p=>{ if(p.dir==='up') paScore+=1; if(p.dir==='down') paScore-=1; });
-  if(chartPattern){
-    notes.push(`الگوی نموداری شناسایی‌شده: ${chartPattern.type} — ${chartPattern.status}`);
-    // فقط در صورت شکست تأییدشده (بسته‌شدن کندل بیرون از الگو) امتیاز می‌گیرد، نه صرفاً لمس خط
-    if(chartPattern.breakout==='up') paScore += 1;
-    else if(chartPattern.breakout==='down') paScore -= 1;
-  }
-  let waveScore = 0;
-  if(waveEngine){
-    notes.push(`فشار موج/شکست: ${waveEngine.overall} (صعودی ${waveEngine.bullishPressure}/۱۰۰ | نزولی ${waveEngine.bearishPressure}/۱۰۰) — این فشار است نه تأیید شکست`);
-    if(waveEngine.bullishPressure - waveEngine.bearishPressure >= 20) waveScore = 1;
-    else if(waveEngine.bearishPressure - waveEngine.bullishPressure >= 20) waveScore = -1;
-  }
-  score += paScore + waveScore;
-
-  // حجم
-  let volScore = 0;
-  if(volRising){
-    volScore = (closes.at(-1) > closes.at(-2)) ? 1 : -1;
-    notes.push('حجم معاملات بالاتر از میانگین ۲۰ کندل اخیر (تأیید حرکت)');
-  } else notes.push('حجم معاملات عادی/پایین (بدون تأیید قوی)');
-  score += volScore;
-
-  // موقعیت نسبت به S/R و باند بولینگر
-  let srScore = 0;
-  const nearestRes = resistances[0]?.price;
-  const nearestSup = supports.at(-1)?.price;
-  if(nearestRes && (nearestRes-lastClose)/lastClose*100 < 0.5){ srScore -= 1; notes.push('قیمت نزدیک به مقاومت مهم — احتمال واکنش نزولی'); }
-  if(nearestSup && (lastClose-nearestSup)/lastClose*100 < 0.5){ srScore += 1; notes.push('قیمت نزدیک به حمایت مهم — احتمال واکنش صعودی'); }
-  if(lastClose <= bb.lower){ srScore += 1; notes.push(`قیمت به باند پایین بولینگر رسیده (${bb.lower.toFixed(4)}) — احتمال اشباع فروش کوتاه‌مدت`); }
-  if(lastClose >= bb.upper){ srScore -= 1; notes.push(`قیمت به باند بالای بولینگر رسیده (${bb.upper.toFixed(4)}) — احتمال اشباع خرید کوتاه‌مدت`); }
-  score += srScore;
-
-  // قدرت روند (ADX) — فقط ضریب اطمینان را تغییر می‌دهد، نه جهت
-  let trendStrengthNote = '';
-  if(adxVal.adx >= 25){ trendStrengthNote = `ADX=${adxVal.adx.toFixed(1)} → روند قوی و قابل‌اتکا`; }
-  else { trendStrengthNote = `ADX=${adxVal.adx.toFixed(1)} → روند ضعیف/بازار رنج، اعتبار سیگنال‌های روندی کمتر است`; }
-  notes.push(trendStrengthNote);
-
-  // تأیید چندتایم‌فریمی
-  let htfScore = 0;
-  if(htfTrend === 'up'){ htfScore = 1; notes.push('روند تایم‌فریم بالاتر نیز صعودی است (تأیید هم‌راستا)'); }
-  else if(htfTrend === 'down'){ htfScore = -1; notes.push('روند تایم‌فریم بالاتر نیز نزولی است (تأیید هم‌راستا)'); }
-  else if(htfTrend === 'mixed'){ notes.push('روند تایم‌فریم بالاتر مختلط/نامشخص است — احتیاط بیشتر'); }
-  score += htfScore;
-
-  // VWAP — سطح مرجع نهادی
-  let vwapScore = 0;
-  if(lastClose > vwapVal){ vwapScore = 1; notes.push(`قیمت بالای VWAP (${vwapVal.toFixed(4)}) — تمایل خریداران نهادی`); }
-  else { vwapScore = -1; notes.push(`قیمت زیر VWAP (${vwapVal.toFixed(4)}) — تمایل فروشندگان نهادی`); }
-  score += vwapScore;
-
-  // ساختار بازار (Smart Money: BOS / CHoCH)
-  let structureScore = 0;
-  if(structure?.bos){
-    if(structure.bos.includes('صعودی')){ structureScore = structure.bos.startsWith('CHoCH')?1:2; notes.push(structure.bos); }
-    else { structureScore = structure.bos.startsWith('CHoCH')?-1:-2; notes.push(structure.bos); }
-  } else if(structure){ notes.push(`ساختار بازار: ${structure.structure}`); }
-  score += structureScore;
-
-  // نزدیکی به فیبوناچی (سطح ۰.۵ / ۰.۶۱۸ به‌عنوان ناحیه طلایی)
-  let fibScore = 0;
-  if(fib){
-    const golden = [fib.levels[0.5], fib.levels[0.618]];
-    const near = golden.find(lv => Math.abs(lv-lastClose)/lastClose*100 < 0.4);
-    if(near){
-      fibScore = fib.impulseUp ? 1 : -1;
-      notes.push(`قیمت در ناحیه طلایی فیبوناچی (۰.۵-۰.۶۱۸) نسبت به آخرین لگ قیمتی قرار دارد`);
-    }
-  }
-  score += fibScore;
-
-  // نزدیکی به Order Block
-  let obScore = 0;
-  if(orderBlock){
-    const inZone = lastClose >= orderBlock.low && lastClose <= orderBlock.high;
-    const nearZone = Math.abs(((orderBlock.high+orderBlock.low)/2)-lastClose)/lastClose*100 < 0.6;
-    if(inZone || nearZone){
-      obScore = orderBlock.dir==='bull' ? 1 : -1;
-      notes.push(`قیمت در محدوده Order Block ${orderBlock.dir==='bull'?'صعودی (حمایتی)':'نزولی (مقاومتی)'} قرار دارد`);
-    }
-  }
-  score += obScore;
-
-  // نقدینگی: Liquidity Sweep نزدیک Equal High/Low
-  let liqScore = 0;
-  if(liquidity?.sweep){
-    liqScore = liquidity.sweep.includes('صعودی') ? 1 : -1;
-    notes.push(liquidity.sweep);
-  }
-  score += liqScore;
-
-  // --- محاسبه سطح اطمینان (Confidence) ---
-  const maxPossible = 20; // حداکثر تئوریک امتیاز با اسکیل‌های جدید
-  let confidence = Math.min(95, Math.round((Math.abs(score)/maxPossible)*100));
-  if(adxVal.adx < 20) confidence = Math.round(confidence*0.7); // روند ضعیف = اطمینان کمتر
-  if(htfTrend === 'mixed') confidence = Math.round(confidence*0.85);
-  confidence = Math.max(5, confidence);
-
-  // --- تصمیم نهایی ---
-  let verdict, verdictClass;
-  const dataQualityOK = candles.length >= 100 && volAvg > 0;
-  const htfConflict = (htfTrend==='up' && score<0) || (htfTrend==='down' && score>0);
-  if(!dataQualityOK){
-    verdict = 'داده کافی/باکیفیت نیست — بدون سیگنال'; verdictClass='v-none';
-  } else if(htfConflict && Math.abs(score) < 5){
-    verdict = 'HOLD — تناقض بین تایم‌فریم فعلی و تایم‌فریم بالاتر، ورود توصیه نمی‌شود'; verdictClass='v-hold';
-  } else if(score >= 6){
-    verdict = 'BUY (خرید) — همگرایی قوی سیگنال‌های صعودی'; verdictClass='v-buy';
-  } else if(score <= -6){
-    verdict = 'SELL (فروش) — همگرایی قوی سیگنال‌های نزولی'; verdictClass='v-sell';
-  } else if(score >= 3){
-    verdict = 'تمایل به BUY، اما با احتیاط — سیگنال‌ها هم‌جهت اما ضعیف'; verdictClass='v-hold';
-  } else if(score <= -3){
-    verdict = 'تمایل به SELL، اما با احتیاط — سیگنال‌ها هم‌جهت اما ضعیف'; verdictClass='v-hold';
-  } else {
-    verdict = 'HOLD — عدم قطعیت / سیگنال‌های متضاد، وارد پوزیشن نشوید'; verdictClass='v-hold';
-  }
-
-  // --- مدیریت ریسک: ستاپ معاملاتی (فعال وقتی سیگنال قاطع است، وگرنه سناریوی شرطی/در انتظار) ---
-  function buildPlan(dir, entryPrice, isActive){
-    const slByATR = entryPrice - dir*atrVal*1.5;
-    const slBySR = dir===1 ? (nearestSup ?? slByATR) : (nearestRes ?? slByATR);
-    const stopLoss = dir===1 ? Math.min(slByATR, slBySR) : Math.max(slByATR, slBySR);
-    const riskAmount = Math.abs(entryPrice - stopLoss);
-    if(riskAmount <= 0) return null;
-    const takeProfit1 = entryPrice + dir*riskAmount*1.5;
-    const takeProfit2 = entryPrice + dir*riskAmount*2.5;
-    const structuralTP3 = dir===1
-      ? resistances.find(r=>r.price > takeProfit2)?.price
-      : supports.find(s=>s.price < takeProfit2)?.price;
-    const takeProfit3 = structuralTP3 ?? (entryPrice + dir*riskAmount*4);
-    const atrPct = (atrVal / lastClose) * 100;
-    let suggestedLeverage;
-    if(confidence < 40 || atrPct > 4) suggestedLeverage = '۱x تا ۳x (نوسان بالا/اطمینان پایین — لوریج پایین یا اسپات)';
-    else if(confidence < 65 || atrPct > 2) suggestedLeverage = '۳x تا ۵x (احتیاط، ریسک هر ترید را حداکثر ۱-۲٪ سرمایه نگه دار)';
-    else suggestedLeverage = '۵x تا ۱۰x (حداکثر پیشنهادی؛ حتی در بهترین ستاپ بالاتر از این توصیه نمی‌شود)';
-    return {
-      direction: dir===1 ? 'LONG' : 'SHORT',
-      active: isActive,
-      entry: entryPrice, stopLoss, takeProfit1, takeProfit2, takeProfit3,
-      riskRewardTP1: 1.5, riskRewardTP2: 2.5,
-      riskRewardTP3: +(Math.abs(takeProfit3-entryPrice)/riskAmount).toFixed(2),
-      suggestedLeverage,
-      estimatedFeeNote: 'کارمزد نمونه بایننس (Taker): اسپات ~۰.۱٪ | فیوچرز ~۰.۰۴٪-۰.۰۵٪ در هر پا (ورود+خروج جمعاً دو برابر) — درصد واقعی به سطح تخفیف/VIP حساب شما بستگی دارد.'
-    };
-  }
-
-  let risk = null;         // ستاپ فعال (Entry الان) — فقط وقتی سیگنال قاطع باشد
-  let watchLong = null, watchShort = null; // سناریوهای شرطی (Primary/Alternative) — همیشه در صورت وجود سطح معتبر محاسبه می‌شوند
-  if(dataQualityOK){
-    if(verdictClass==='v-buy'){ risk = buildPlan(1, lastClose, true); risk.state = 5; risk.entryState = 'ENTRY VALID'; }
-    else if(verdictClass==='v-sell'){ risk = buildPlan(-1, lastClose, true); risk.state = 5; risk.entryState = 'ENTRY VALID'; }
-    // سناریوی شرطی صعودی: اگر قیمت نزدیک‌ترین حمایت را لمس/رد کند یا نزدیک‌ترین مقاومت را بشکند
-    if(nearestSup){ watchLong = buildPlan(1, nearestSup, false); if(watchLong){ watchLong.trigger = `واکنش صعودی از حمایت ${nearestSup.toFixed(4)} یا شکست تأییدشدهٔ مقاومت ${ (nearestRes??nearestSup).toFixed(4) }`; watchLong.state = (Math.abs(lastClose-nearestSup)/lastClose*100 < 0.5) ? 2 : 1; watchLong.entryState = watchLong.state===2 ? 'LEVEL TOUCHED' : 'APPROACHING LEVEL'; } }
-    // سناریوی شرطی نزولی: اگر قیمت نزدیک‌ترین مقاومت را رد کند یا نزدیک‌ترین حمایت را بشکند
-    if(nearestRes){ watchShort = buildPlan(-1, nearestRes, false); if(watchShort){ watchShort.trigger = `رد شدن از مقاومت ${nearestRes.toFixed(4)} یا شکست تأییدشدهٔ حمایت ${ (nearestSup??nearestRes).toFixed(4) }`; watchShort.state = (Math.abs(nearestRes-lastClose)/lastClose*100 < 0.5) ? 2 : 1; watchShort.entryState = watchShort.state===2 ? 'LEVEL TOUCHED' : 'APPROACHING LEVEL'; } }
-  }
-
-  // --- نقاط سوئینگ اخیر (برای امکان تشخیص الگوهایی مثل دبل‌تاپ/باتم و سر-و-شانه توسط AI، فقط از داده واقعی) ---
-  const { highs: swingHighsRaw, lows: swingLowsRaw } = findSwingPoints(candles, 3);
-  const recentSwingHighs = swingHighsRaw.slice(-6).map(p=>+p.toFixed(6));
-  const recentSwingLows = swingLowsRaw.slice(-6).map(p=>+p.toFixed(6));
-
+  const score=weightedAnalysisScore({structure:structureRaw,trend:(trendRaw*.65+htfRaw*.35),ichimoku:ichRaw,sr:srRaw,volume:volRaw,priceAction:paRaw,wave:waveRaw,pattern:patRaw,momentum:momRaw,smc:smcRaw,fib:fibRaw});
+  let directional=score.directional;
+  // HTF conflict is a hard quality penalty, not an invisible offset.
+  const htfConflict=(htfTrend==='up'&&directional<0)||(htfTrend==='down'&&directional>0);
+  let setupQuality=clamp(Math.round(50+directional/2 - (htfConflict?10:0) - (adxVal.adx<18?7:0)),0,100);
+  const longTrigger=Boolean((structure.event?.includes('صعودی')||chartPattern?.breakout==='up'||classicalPatterns.some(p=>p.dir==='up'&&p.status==='CONFIRMED')) && volume.ratio>=1.1 && lastClose>ema20);
+  const shortTrigger=Boolean((structure.event?.includes('نزولی')||chartPattern?.breakout==='down'||classicalPatterns.some(p=>p.dir==='down'&&p.status==='CONFIRMED')) && volume.ratio>=1.1 && lastClose<ema20);
+  const nearSupport=nearestSup&&pctDistance(lastClose,nearestSup)<1.0, nearResistance=nearestRes&&pctDistance(lastClose,nearestRes)<1.0;
+  const longReadiness=clamp(Math.round((setupQuality*.55)+(longTrigger?30:0)+(nearSupport?10:0)-(htfTrend==='down'?20:0)),0,100);
+  const shortReadiness=clamp(Math.round((setupQuality*.55)+(shortTrigger?30:0)+(nearResistance?10:0)-(htfTrend==='up'?20:0)),0,100);
+  let direction=directional>=0?'LONG':'SHORT';
+  const readiness=direction==='LONG'?longReadiness:shortReadiness;
+  let verdictClass='v-hold', verdict='NO TRADE — کیفیت یا تریگر کافی نیست';
+  if(setupQuality>=80 && longReadiness>=80 && directional>15){verdictClass='v-buy';verdict='🟢 ENTER LONG — ستاپ با کیفیت بالا و تریگر تأییدشده';}
+  else if(setupQuality>=80 && shortReadiness>=80 && directional<-15){verdictClass='v-sell';verdict='🔴 ENTER SHORT — ستاپ با کیفیت بالا و تریگر تأییدشده';}
+  else if(setupQuality>=70 && directional>10){verdict='🟡 WAIT FOR LONG — ستاپ خوب است، اما ورود هنوز تأیید کامل ندارد';}
+  else if(setupQuality>=70 && directional<-10){verdict='🟠 WAIT FOR SHORT — ستاپ خوب است، اما ورود هنوز تأیید کامل ندارد';}
+  else if(setupQuality<60){verdict='⚪ NO TRADE — کیفیت ستاپ زیر حداقل آستانه است';}
+  const planLong=buildProfessionalPlan('LONG',nearSupport||lastClose,atrVal,supports,resistances,setupQuality,longTrigger&&longReadiness>=80);
+  const planShort=buildProfessionalPlan('SHORT',nearResistance||lastClose,atrVal,supports,resistances,setupQuality,shortTrigger&&shortReadiness>=80);
+  const risk=verdictClass==='v-buy'?planLong:verdictClass==='v-sell'?planShort:null;
+  const watchLong=planLong?{...planLong,active:false,trigger:`بسته‌شدن بالای مقاومت/تریگر با حجم ≥ ۱.۱x میانگین ۲۰ کندل؛ سپس تأیید مجدد ساختار`,state:longTrigger?4:nearSupport?2:1,entryState:longTrigger?'TRIGGER CONFIRMED':nearSupport?'LEVEL TOUCHED':'APPROACHING LEVEL'}:null;
+  const watchShort=planShort?{...planShort,active:false,trigger:`بسته‌شدن زیر حمایت/تریگر با حجم ≥ ۱.۱x میانگین ۲۰ کندل؛ سپس تأیید مجدد ساختار`,state:shortTrigger?4:nearResistance?2:1,entryState:shortTrigger?'TRIGGER CONFIRMED':nearResistance?'LEVEL TOUCHED':'APPROACHING LEVEL'}:null;
+  const notes=[];
+  notes.push(`مدل امتیازدهی وزنی: Market Structure=20، Trend/HTF=15، Ichimoku=12، S/R=10، Volume=10، Price Action=8، Wave=8، Pattern=6، Momentum=5، SMC=4، Fibonacci=2.`);
+  notes.push(`Setup Quality=${setupQuality}/100 | Entry Readiness=${readiness}/100 | امتیاز جهت‌دار=${directional.toFixed(1)}`);
+  notes.push(`ساختار: ${structure.structure}${structure.event?' | '+structure.event:''}`);
+  notes.push(`Ichimoku: ${ich?.priceVsCloud||'N/A'} | TK=${ich?.tkCross||'N/A'} | Future Cloud=${ich?.bullishFuture?'Bullish':'Bearish'}`);
+  notes.push(`حجم: ${volume.ratio.toFixed(2)}x میانگین ۲۰ کندل | ADX=${adxVal.adx.toFixed(1)}`);
+  if(htfConflict)notes.push('⚠ تعارض تایم‌فریم بالاتر با جهت فعلی؛ کیفیت سیگنال کاهش داده شد.');
+  if(!longTrigger&&!shortTrigger)notes.push('تریگر بسته‌شدن + حجم هنوز تأیید نشده؛ لمس سطح ورود محسوب نمی‌شود.');
+  const confidence=clamp(Math.round(setupQuality*(readiness/100)),5,95);
   return {
-    lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
-    fib, vwapVal, structure, orderBlock, fvgs, liquidity,
-    resistances, supports, patterns, chartPattern, waveEngine, recentSwingHighs, recentSwingLows, notes, score, verdict, verdictClass, confidence, risk, watchLong, watchShort,
-    trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore, liqScore
+    lastClose,ema20,ema50,ema200,rsiVal,macdVal,atrVal,bb,stoch,adxVal,divergence,htfTrend,fib,vwapVal,structure:legacyStructure||structure,
+    advancedStructure:structure,ichimoku:ich,orderBlock,fvgs,liquidity,volumeMetrics:volume,volumeProfile:vp,resistances,supports,patterns,chartPattern,classicalPatterns,waveEngine,
+    recentSwingHighs:highs.slice(-8),recentSwingLows:lows.slice(-8),notes,
+    score:directional,setupQuality,entryReadiness:readiness,confidence,verdict,verdictClass,risk,watchLong,watchShort,
+    entryState:verdictClass==='v-buy'||verdictClass==='v-sell'?'ENTRY VALID':longReadiness>=70||shortReadiness>=70?'TRIGGER FORMED':'NO SETUP',
+    trendScore:Math.round(trendRaw*2),momScore:Math.round(momRaw*2),paScore:Math.round(paRaw*2),volScore:Math.round(volRaw*2),srScore:Math.round(srRaw*2),htfScore:Math.round(htfRaw*2),vwapScore:lastClose>vwapVal?1:-1,structureScore:Math.round(structureRaw*2),fibScore:Math.round(fibRaw*2),obScore:orderBlock?(orderBlock.dir==='bull'?1:-1):0,liqScore:liquidity?.sweep?(liquidity.sweep.includes('صعودی')?1:-1):0,
+    componentScores:{structure:structureRaw,trend:trendRaw,ichimoku:ichRaw,supportResistance:srRaw,volume:volRaw,priceAction:paRaw,wave:waveRaw,pattern:patRaw,momentum:momRaw,smc:smcRaw,fibonacci:fibRaw},
+    dataQuality:{ok:true,closedCandles:true,candleCount:candles.length,lastClosedTime:candles.at(-1)?.closeTime}
   };
+}
+
+// ---------- Stability Engine V2: جلوگیری از flapping بین اسکن‌ها ----------
+const STABILITY_V2={persistMs:15*60*1000,rankAdvantage:8,scoreDeltaKeep:5};
+function applySignalStability(items,mode='scan'){
+  const now=Date.now(), key='scanner_stability_v2'; let old={}; try{old=JSON.parse(localStorage.getItem(key)||'{}')}catch(e){}
+  const out=items.map((x,i)=>{
+    const id=x.symbol; const prev=old[id]; const current={symbol:id,score:x.score,quality:x.setupQuality,verdict:x.verdictClass,state:x.entryState,t:now};
+    if(prev){
+      const delta=Math.abs((x.score||0)-(prev.score||0));
+      const sameDirection=(x.verdictClass===prev.verdict);
+      const within=now-prev.t<STABILITY_V2.persistMs;
+      x.stability={sameDirection,scoreDelta:+delta.toFixed(2),withinPersistence:within,changedReason:delta>15?'material score change':sameDirection?'NO MATERIAL CHANGE':'direction/state changed'};
+      if(within && delta<STABILITY_V2.scoreDeltaKeep && prev.verdict!=='v-none') x.stableRank=true;
+    }
+    old[id]=current; return x;
+  });
+  try{localStorage.setItem(key,JSON.stringify(old));}catch(e){}
+  out.sort((a,b)=>{
+    const sa=(a.setupQuality||0)+(a.stableRank?4:0), sb=(b.setupQuality||0)+(b.stableRank?4:0);
+    return sb-sa;
+  });
+  return out;
 }
 
 // ---------- پایداری سیگنال بین رفرش‌ها (جلوگیری از تغییر مکرر سیگنال به‌خاطر نوسان کندل زنده) ----------
@@ -918,7 +930,7 @@ function renderResult(res, symbol, interval, lastClosedTime){
   if(res.insufficient){
     els.verdictBox.className = 'verdict v-none';
     els.verdictBox.textContent = 'داده کافی برای تحلیل معتبر وجود ندارد (حداقل ۶۰ کندل لازم است). به‌جای حدس زدن، تحلیلی ارائه نمی‌شود.';
-    ['scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard'].forEach(id=>document.getElementById(id).style.display='none');
+    ['qualityCard','scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard'].forEach(id=>document.getElementById(id).style.display='none');
     return;
   }
 
@@ -933,6 +945,15 @@ function renderResult(res, symbol, interval, lastClosedTime){
     stabilityNote = `این اولین بار است که این وضعیت روی این نماد/تایم‌فریم ثبت می‌شود.`;
   }
   els.verdictBox.innerHTML = res.verdict + `<br><span style="font-size:12px;font-weight:400">امتیاز: ${res.score} | سطح اطمینان: ${res.confidence}%</span><br><span style="font-size:11px;font-weight:400;opacity:.85">${stabilityNote}</span>`;
+
+  const qualityCard=document.getElementById('qualityCard');
+  if(qualityCard){
+    qualityCard.style.display='block';
+    document.getElementById('setupQuality').textContent=`${res.setupQuality||0}/100`;
+    document.getElementById('entryReadiness').textContent=`${res.entryReadiness||0}/100`;
+    document.getElementById('entryState').textContent=res.entryState||'NO SETUP';
+    document.getElementById('dominantDirection').textContent=res.score>0?'LONG':res.score<0?'SHORT':'NEUTRAL';
+  }
 
   document.getElementById('scoreCard').style.display='block';
   document.getElementById('s_trend').innerHTML = label(res.trendScore);
@@ -1015,6 +1036,10 @@ function renderResult(res, symbol, interval, lastClosedTime){
   document.getElementById('ind_macd').textContent = `${res.macdVal.macd.toFixed(4)} / سیگنال ${res.macdVal.signal.toFixed(4)} / هیست ${res.macdVal.hist.toFixed(4)}`;
   document.getElementById('ind_ema').textContent = `${res.ema20.toFixed(4)} / ${res.ema50.toFixed(4)} / ${res.ema200? res.ema200.toFixed(4):'—'}`;
   document.getElementById('ind_atr').textContent = res.atrVal.toFixed(4);
+  const ichRow=document.getElementById('ind_ichimoku');
+  if(ichRow) ichRow.textContent=res.ichimoku?`${res.ichimoku.priceVsCloud} | TK ${res.ichimoku.tkCross} | ${res.ichimoku.score}/100`: '—';
+  const vr=document.getElementById('ind_volratio'); if(vr) vr.textContent=res.volumeMetrics?`${res.volumeMetrics.ratio.toFixed(2)}x`: '—';
+
   const bbRow=document.getElementById('ind_bb_row'), stochRow=document.getElementById('ind_stoch_row'), adxRow=document.getElementById('ind_adx_row');
   if(bbRow){ bbRow.style.display='flex'; document.getElementById('ind_bb').textContent = `${res.bb.lower.toFixed(4)} / ${res.bb.mid.toFixed(4)} / ${res.bb.upper.toFixed(4)}`; }
   if(stochRow){ stochRow.style.display='flex'; document.getElementById('ind_stoch').textContent = `K=${res.stoch.k.toFixed(1)} D=${res.stoch.d.toFixed(1)}`; }
@@ -1072,7 +1097,7 @@ async function maybeCallAI(res, symbol, interval){
   const mtf = await buildMultiTimeframeSnapshot(symbol);
 
   const dataSummary = {
-    symbol, workingInterval: interval,
+    symbol, workingInterval: interval, dataQuality: res.dataQuality,
     lastClose: res.lastClose, ema20: res.ema20, ema50: res.ema50, ema200: res.ema200,
     rsi: res.rsiVal, macd: res.macdVal, atr: res.atrVal,
     bollinger: res.bb, stochastic: res.stoch, adx: res.adxVal, rsiDivergence: res.divergence,
@@ -1083,6 +1108,8 @@ async function maybeCallAI(res, symbol, interval){
     resistances: res.resistances, supports: res.supports,
     patterns: res.patterns.map(p=>p.name),
     chartPattern: res.chartPattern,
+    setupQuality: res.setupQuality, entryReadiness: res.entryReadiness, entryState: res.entryState,
+    componentScoresV2: res.componentScores, ichimoku: res.ichimoku, volumeMetrics: res.volumeMetrics, volumeProfile: res.volumeProfile, advancedStructure: res.advancedStructure, classicalPatterns: res.classicalPatterns,
     waveStrengthEngine: res.waveEngine, // موج‌های اخیر با قدرت/شتاب/فشار شکست صعودی و نزولی (0-100) // کانال/مثلث/گوه شناسایی‌شده روی سوئینگ‌های اخیر (یا null)
     recentSwingHighs: res.recentSwingHighs, // آخرین قله‌های سوئینگ واقعی (برای بررسی دبل‌تاپ/سر-و-شانه و... توسط AI)
     recentSwingLows: res.recentSwingLows,  // آخرین دره‌های سوئینگ واقعی (برای بررسی دبل‌باتم و...)
@@ -1113,6 +1140,13 @@ async function maybeCallAI(res, symbol, interval){
 - فیلد notAvailable نشان می‌دهد Order Flow، Open Interest، Funding Rate، Long/Short Ratio و اخبار فاندامنتال در دسترس نیستند — برای این موارد فقط بنویس «داده در دسترس نیست» و هرگز ادعای Whale Activity یا Smart Money بدون مبنای واقعی نکن.
 - اگر dataQuality پرچم مشکل داشت یا اعداد به‌هم نمی‌خوردند، بنویس «DATA SYNCHRONIZATION ERROR» و به NO TRADE برو.
 - تایم‌فریم کاری فعلی workingInterval است؛ داده مولتی‌تایم‌فریم در multiTimeframeAnalysis (1d/4h/1h/15m/5m در صورت وجود) آمده. هر عددی که از یک تایم‌فریم می‌آوری را برچسب‌گذاری کن، هرگز اندیکاتورهای تایم‌فریم‌های مختلف را بی‌برچسب قاطی نکن.
+
+## موتور امتیازدهی V2 (اجباری)
+- Setup Quality عدد ۰ تا ۱۰۰ برای کیفیت خود ستاپ است؛ Entry Readiness عدد ۰ تا ۱۰۰ برای آماده‌بودن ورود همین لحظه است. این دو را هرگز یکی فرض نکن.
+- وزن‌ها: Market Structure 20، Trend/HTF 15، Ichimoku 12، Support/Resistance 10، Volume 10، Price Action 8، Wave 8، Chart Pattern 6، Momentum 5، SMC/Liquidity 4، Fibonacci 2.
+- Market Structure و HTF نسبت به RSI/MACD اولویت دارند. یک اندیکاتور منفرد حق ساختن سیگنال ندارد.
+- اگر HTF با جهت فعلی متعارض است، آن را Counter-trend اعلام کن و کیفیت را کاهش بده.
+- فقط وقتی ENTER صادر کن که کیفیت بالا، جهت ساختاری روشن، تریگر بسته‌شدن و تأیید حجم/مومنتوم و R:R قابل‌قبول هم‌زمان وجود داشته باشد؛ در غیر این صورت WAIT/NO TRADE.
 
 ## اصل اصلی
 سیگنال معتبر فقط وقتی صادر می‌شود که: Context بازار + ساختار بازار (marketStructure) + سطح کلیدی (resistances/supports/fibonacci) + پرایس‌اکشن (patterns) + الگوی نموداری (chartPattern: کانال/مثلث/گوه، در صورت وجود) + تریگر ورود + تأیید (حجم/مومنتوم) + ریسک به ریوارد قابل‌قبول همگی هم‌راستا باشند. اگر یکی از این‌ها ناقص یا متناقض بود → WAIT.
@@ -1198,7 +1232,7 @@ ${JSON.stringify(dataSummary)}`;
         method:'POST',
         headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+settings.apiKey },
         body: JSON.stringify({
-          model:'gpt-4o-mini',
+          model:'gpt-5-mini',
           max_tokens: 2200,
           messages:[{role:'user', content: prompt}]
         })
@@ -1284,7 +1318,7 @@ function scannerCardHTML(item, kind){
     <div class="row"><span>امتیاز/اطمینان</span><span>${item.score} | ${item.confidence}%</span></div>
     <div class="row"><span>وضعیت</span><span>${item.verdict}</span></div>
     <div class="row"><span>الگو</span><span>${patternLine}</span></div>
-    <p class="muted" style="margin:6px 0 0">${planLine}</p>
+    <p class="muted" style="margin:6px 0 0">${planLine}</p>${item.stability?`<p class="muted">پایداری: ${item.stability.changedReason}${item.stability.withinPersistence?' | در پنجره پایداری':''}</p>`:''}
   </div>`;
 }
 
@@ -1295,20 +1329,21 @@ async function runMarketScan(){
     const btc = await getBTCBias();
     els.scannerBody.innerHTML = `<div class="loading">بایاس BTC: ${btc.bias} — در حال اسکن نقدشونده‌ترین جفت‌ارزها (فیلتر اول)...</div>`;
 
-    const tickers = await fetchTop24hTickers(30);
+    const tickers = await fetchTop24hTickers(40);
     const filtered = await quickFilterCandidates(tickers);
 
     // انتخاب کاندیدهای دسته A برای تحلیل عمیق: قوی‌ترین مومنتوم صعودی و نزولی (هرکدام تا ۶ نماد)
-    const sortedUp = [...filtered].sort((a,b)=>b.momentum-a.momentum).slice(0,6);
-    const sortedDown = [...filtered].sort((a,b)=>a.momentum-b.momentum).slice(0,6);
+    const sortedUp = [...filtered].sort((a,b)=>b.momentum-a.momentum).slice(0,10);
+    const sortedDown = [...filtered].sort((a,b)=>a.momentum-b.momentum).slice(0,10);
     const candidateSymbols = [...new Set([...sortedUp, ...sortedDown].map(c=>c.symbol))];
 
     els.scannerBody.innerHTML = `<div class="loading">بایاس BTC: ${btc.bias} — در حال تحلیل عمیق ${candidateSymbols.length} کاندیدای دستهٔ A (ساختار بازار، پترن، ریسک)...</div>`;
 
-    const deep = (await Promise.all(candidateSymbols.map(s=>deepAnalyzeSymbol(s)))).filter(Boolean);
+    let deep = (await Promise.all(candidateSymbols.map(s=>deepAnalyzeSymbol(s)))).filter(Boolean);
+    deep = applySignalStability(deep,'scan');
 
-    const longs = deep.filter(d=>d.verdictClass==='v-buy').sort((a,b)=>b.confidence-a.confidence).slice(0,5);
-    const shorts = deep.filter(d=>d.verdictClass==='v-sell').sort((a,b)=>b.confidence-a.confidence).slice(0,5);
+    const longs = deep.filter(d=>d.verdictClass==='v-buy').sort((a,b)=>(b.setupQuality||0)-(a.setupQuality||0)).slice(0,5);
+    const shorts = deep.filter(d=>d.verdictClass==='v-sell').sort((a,b)=>(b.setupQuality||0)-(a.setupQuality||0)).slice(0,5);
     const usedSymbols = new Set([...longs, ...shorts].map(d=>d.symbol));
     const watchlist = deep
       .filter(d=>!usedSymbols.has(d.symbol) && Math.abs(d.score)>=3 && (d.watchLong||d.watchShort))

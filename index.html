@@ -106,6 +106,15 @@
 
     <div id="verdictBox" class="verdict v-none">داده‌ای بارگذاری نشده — نماد و تایم‌فریم را انتخاب و «بارگذاری و تحلیل» را بزن</div>
 
+    <div class="card" id="qualityCard" style="display:none">
+      <h3>کیفیت حرفه‌ای ستاپ</h3>
+      <div class="row"><span>Setup Quality</span><span id="setupQuality">-</span></div>
+      <div class="row"><span>Entry Readiness</span><span id="entryReadiness">-</span></div>
+      <div class="row"><span>Entry State</span><span id="entryState">-</span></div>
+      <div class="row"><span>جهت غالب</span><span id="dominantDirection">-</span></div>
+      <p class="muted">امتیازها وزنی هستند؛ ساختار و تایم‌فریم بالاتر بر اندیکاتورهای منفرد اولویت دارند. NO TRADE نتیجه معتبر است.</p>
+    </div>
+
     <div class="card" id="scoreCard" style="display:none">
       <h3>امتیاز کلی سیگنال (Confluence Score)</h3>
       <div class="row"><span>روند (Trend)</span><span id="s_trend">-</span></div>
@@ -138,6 +147,9 @@
       <div class="row"><span>MACD</span><span id="ind_macd">-</span></div>
       <div class="row"><span>EMA20 / EMA50 / EMA200</span><span id="ind_ema">-</span></div>
       <div class="row"><span>ATR(14)</span><span id="ind_atr">-</span></div>
+      <div class="row"><span>Ichimoku</span><span id="ind_ichimoku">-</span></div>
+      <div class="row"><span>Volume Ratio</span><span id="ind_volratio">-</span></div>
+
       <div class="row" id="ind_bb_row" style="display:none"><span>باند بولینگر (پایین/میانگین/بالا)</span><span id="ind_bb">-</span></div>
       <div class="row" id="ind_stoch_row" style="display:none"><span>Stochastic</span><span id="ind_stoch">-</span></div>
       <div class="row" id="ind_adx_row" style="display:none"><span>ADX (قدرت روند)</span><span id="ind_adx">-</span></div>

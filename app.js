@@ -1084,11 +1084,13 @@ function label(scoreVal){
 }
 
 function renderResult(res, symbol, interval, lastClosedTime){
+  // Clean presentation layer: the full analysis remains backstage; the user sees only the decision + reasons.
+  const backstageIds=['qualityCard','scoreCard','srCard','indCard','paCard','candleCard','waveCard','quantCard','researchCard','edgeCard','aiCard','riskCard','trustCard','proTraderCard'];
+  backstageIds.forEach(id=>{ const el=document.getElementById(id); if(el) el.style.display='none'; });
+
   if(res.insufficient){
-    els.verdictBox.className = 'verdict v-none';
-    els.verdictBox.textContent = 'داده کافی برای تحلیل معتبر وجود ندارد (حداقل ۶۰ کندل لازم است). به‌جای حدس زدن، تحلیلی ارائه نمی‌شود.';
-    ['qualityCard','scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard','trustCard'].forEach(id=>document.getElementById(id).style.display='none');
-    const stalePro=document.getElementById('proTraderCard'); if(stalePro) stalePro.remove();
+    els.verdictBox.className='verdict v-none';
+    els.verdictBox.innerHTML='NOT TRADE<div class="decision-sub">داده کافی یا معتبر برای تصمیم‌گیری وجود ندارد</div>';
     return;
   }
 
@@ -1102,7 +1104,15 @@ function renderResult(res, symbol, interval, lastClosedTime){
   } else {
     stabilityNote = `این اولین بار است که این وضعیت روی این نماد/تایم‌فریم ثبت می‌شود.`;
   }
-  els.verdictBox.innerHTML = res.verdict + `<br><span style="font-size:12px;font-weight:400">امتیاز: ${res.score} | سطح اطمینان: ${res.confidence}%</span><br><span style="font-size:11px;font-weight:400;opacity:.85">${stabilityNote}</span>`;
+  const trustStatus=res.trust?.status || '';
+  let cleanDecision='HOLD';
+  let cleanClass='v-hold';
+  if(trustStatus==='BLOCKED' || res.verdictClass==='v-none') { cleanDecision='NOT TRADE'; cleanClass='v-none'; }
+  else if(res.verdictClass==='v-buy'){ cleanDecision='BUY'; cleanClass='v-buy'; }
+  else if(res.verdictClass==='v-sell'){ cleanDecision='SELL'; cleanClass='v-sell'; }
+  else if(res.verdictClass==='v-hold'){ cleanDecision='HOLD'; cleanClass='v-hold'; }
+  els.verdictBox.className='verdict '+cleanClass;
+  els.verdictBox.innerHTML=`${cleanDecision}<div class="decision-sub">${stabilityNote}</div>`;
 
   const qualityCard=document.getElementById('qualityCard');
   if(qualityCard){
@@ -1284,8 +1294,17 @@ function renderResult(res, symbol, interval, lastClosedTime){
     document.getElementById('candleContent').innerHTML=ch;
   } else if(candleCard) candleCard.style.display='none';
 
-  document.getElementById('reasonCard').style.display='block';
-  document.getElementById('reasonText').innerHTML = '<ul>' + res.notes.map(n=>`<li>${n}</li>`).join('') + '</ul>';
+  const reasonCard=document.getElementById('reasonCard');
+  const reasonText=document.getElementById('reasonText');
+  if(reasonCard && reasonText){
+    reasonCard.style.display='block';
+    const reasons=[...(res.notes||[])];
+    if(res.trust?.reasons?.length) reasons.push(...res.trust.reasons);
+    if(res.proTrader?.killers?.length) reasons.push(...res.proTrader.killers.map(x=>'ریسک/نقض فرضیه: '+x));
+    const unique=[...new Set(reasons.filter(Boolean))].slice(0,6);
+    reasonText.innerHTML='<div class="clean-reasons"><div class="clean-reasons-title">دلایل اصلی تصمیم</div><ul>'+
+      (unique.length?unique.map(n=>`<li>${escapeHTML(n)}</li>`).join(''):'<li>شواهد کافی برای توضیح بیشتر ثبت نشده است.</li>')+'</ul></div>';
+  }
 
   drawAnalysisOnChart(res);
   maybeCallAI(res, symbol, interval);

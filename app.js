@@ -20,6 +20,8 @@ const els = {
   scanCloseBtn: document.getElementById('scanCloseBtn'),
   scannerOverlay: document.getElementById('scannerOverlay'),
   scannerBody: document.getElementById('scannerBody'),
+  capitalInput: document.getElementById('capitalInput'),
+  riskPctInput: document.getElementById('riskPctInput'),
 };
 
 const INTERVAL_MAP_TV = { '1m':'1','5m':'5','15m':'15','30m':'30','1h':'60','4h':'240','1d':'D','1w':'W' };
@@ -497,6 +499,108 @@ function detectChartPatterns(candles, lookback=3, minSwings=3){
   };
 }
 
+// =========================================================
+// ---------- موتور قدرت موج و فشار شکست (Wave Strength & Breakout Pressure Engine) ----------
+// =========================================================
+function buildPivotSequence(candles, lookback=3){
+  const n = candles.length;
+  const pts = [];
+  for(let i=lookback;i<n-lookback;i++){
+    const win = candles.slice(i-lookback, i+lookback+1);
+    const cur = candles[i];
+    if(cur.high === Math.max(...win.map(c=>c.high))) pts.push({ idx:i, price:cur.high, type:'high' });
+    if(cur.low === Math.min(...win.map(c=>c.low))) pts.push({ idx:i, price:cur.low, type:'low' });
+  }
+  pts.sort((a,b)=>a.idx-b.idx);
+  const alt = [];
+  for(const p of pts){
+    const last = alt.at(-1);
+    if(!last){ alt.push(p); continue; }
+    if(last.type === p.type){
+      if(p.type==='high' && p.price > last.price) alt[alt.length-1] = p;
+      if(p.type==='low' && p.price < last.price) alt[alt.length-1] = p;
+    } else alt.push(p);
+  }
+  return alt;
+}
+
+function classifyWaveStrength(effNorm){
+  if(effNorm >= 2.2) return 'خیلی قوی (VERY STRONG)';
+  if(effNorm >= 1.4) return 'قوی (STRONG)';
+  if(effNorm >= 0.8) return 'عادی (NORMAL)';
+  if(effNorm >= 0.4) return 'ضعیف (WEAK)';
+  return 'خیلی ضعیف (VERY WEAK)';
+}
+
+function analyzeWaveStrength(candles, atrVal){
+  const pivots = buildPivotSequence(candles, 3);
+  if(pivots.length < 4 || !atrVal) return null;
+  const recentPivots = pivots.slice(-7);
+  const waves = [];
+  for(let i=1;i<recentPivots.length;i++){
+    const a = recentPivots[i-1], b = recentPivots[i];
+    const priceDispPct = (b.price - a.price) / a.price * 100;
+    const duration = Math.max(b.idx - a.idx, 1);
+    const efficiencyNorm = Math.abs(b.price - a.price) / (atrVal * duration);
+    waves.push({
+      dir: b.price > a.price ? 'up' : 'down',
+      startPrice: a.price, endPrice: b.price,
+      priceDispPct: +priceDispPct.toFixed(2),
+      duration, efficiencyNorm: +efficiencyNorm.toFixed(2),
+      strength: classifyWaveStrength(efficiencyNorm)
+    });
+  }
+  if(waves.length < 2) return null;
+
+  function accel(dir){
+    const seq = waves.filter(w=>w.dir===dir).map(w=>w.efficiencyNorm);
+    if(seq.length < 2) return 'داده ناکافی';
+    const last = seq.at(-1), prev = seq.at(-2);
+    if(last > prev*1.1) return 'شتاب‌گیرنده (Accelerating)';
+    if(last < prev*0.9) return 'کاهش‌شونده (Decelerating)';
+    return 'باثبات (Stable)';
+  }
+  const upAccel = accel('up');
+  const downAccel = accel('down');
+
+  const absDisp = waves.map(w=>Math.abs(w.priceDispPct));
+  const pivotExpanding = absDisp.length>=3 && absDisp.at(-1) > absDisp.at(-2) && absDisp.at(-2) > absDisp.at(-3);
+  const pivotContracting = absDisp.length>=3 && absDisp.at(-1) < absDisp.at(-2) && absDisp.at(-2) < absDisp.at(-3);
+
+  const lastWave = waves.at(-1);
+  const oppDir = lastWave.dir==='up' ? 'down' : 'up';
+  const oppWaves = waves.filter(w=>w.dir===oppDir);
+  const pullbackWeakening = oppWaves.length>=2 && Math.abs(oppWaves.at(-1).priceDispPct) < Math.abs(oppWaves.at(-2).priceDispPct);
+
+  function pressureScore(dir){
+    let s = 0;
+    const dirWaves = waves.filter(w=>w.dir===dir);
+    if(!dirWaves.length) return 5;
+    const avgStrength = dirWaves.reduce((a,w)=>a+w.efficiencyNorm,0)/dirWaves.length;
+    s += Math.min(avgStrength/2.2, 1) * 20;
+    s += ((dir==='up'?upAccel:downAccel).includes('Accelerating') ? 15 : (dir==='up'?upAccel:downAccel).includes('Decelerating') ? 0 : 7);
+    s += (pivotExpanding ? 15 : pivotContracting ? 0 : 7);
+    const lastDirWave = dirWaves.at(-1);
+    s += Math.min((lastDirWave?.efficiencyNorm||0)/2.2, 1) * 10;
+    s += (lastWave.dir===dir && pullbackWeakening ? 10 : 5);
+    s += 5; s += 5; s += 10; // Boundary/Volume/Structure — بدون داده اضافه، خنثی
+    return Math.round(Math.min(s, 95));
+  }
+  const bullishPressure = pressureScore('up');
+  const bearishPressure = pressureScore('down');
+  let overall;
+  if(Math.abs(bullishPressure-bearishPressure) < 10) overall = 'متعادل (BALANCED PRESSURE)';
+  else overall = bullishPressure > bearishPressure ? 'فشار صعودی غالب (BULLISH BREAKOUT PRESSURE)' : 'فشار نزولی غالب (BEARISH BREAKOUT PRESSURE)';
+
+  return {
+    waves: waves.slice(-4),
+    upAcceleration: upAccel, downAcceleration: downAccel,
+    pivotTrend: pivotExpanding ? 'در حال انبساط' : pivotContracting ? 'در حال انقباض' : 'نامشخص',
+    pullbackWeakening,
+    bullishPressure, bearishPressure, overall
+  };
+}
+
 // ---------- تشخیص پترن‌های پرایس اکشن ----------
 function detectPatterns(candles){
   const patterns=[];
@@ -570,6 +674,7 @@ function analyze(candles, htfCandles){
 
   const patterns = detectPatterns(candles);
   const chartPattern = detectChartPatterns(candles);
+  const waveEngine = analyzeWaveStrength(candles, atrVal);
 
   const volAvg = sma(volumes, 20);
   const volLast = volumes.at(-1);
@@ -614,7 +719,13 @@ function analyze(candles, htfCandles){
     if(chartPattern.breakout==='up') paScore += 1;
     else if(chartPattern.breakout==='down') paScore -= 1;
   }
-  score += paScore;
+  let waveScore = 0;
+  if(waveEngine){
+    notes.push(`فشار موج/شکست: ${waveEngine.overall} (صعودی ${waveEngine.bullishPressure}/۱۰۰ | نزولی ${waveEngine.bearishPressure}/۱۰۰) — این فشار است نه تأیید شکست`);
+    if(waveEngine.bullishPressure - waveEngine.bearishPressure >= 20) waveScore = 1;
+    else if(waveEngine.bearishPressure - waveEngine.bullishPressure >= 20) waveScore = -1;
+  }
+  score += paScore + waveScore;
 
   // حجم
   let volScore = 0;
@@ -768,7 +879,7 @@ function analyze(candles, htfCandles){
   return {
     lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
     fib, vwapVal, structure, orderBlock, fvgs, liquidity,
-    resistances, supports, patterns, chartPattern, recentSwingHighs, recentSwingLows, notes, score, verdict, verdictClass, confidence, risk, watchLong, watchShort,
+    resistances, supports, patterns, chartPattern, waveEngine, recentSwingHighs, recentSwingLows, notes, score, verdict, verdictClass, confidence, risk, watchLong, watchShort,
     trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore, liqScore
   };
 }
@@ -807,7 +918,7 @@ function renderResult(res, symbol, interval, lastClosedTime){
   if(res.insufficient){
     els.verdictBox.className = 'verdict v-none';
     els.verdictBox.textContent = 'داده کافی برای تحلیل معتبر وجود ندارد (حداقل ۶۰ کندل لازم است). به‌جای حدس زدن، تحلیلی ارائه نمی‌شود.';
-    ['scoreCard','srCard','indCard','paCard','reasonCard','riskCard','aiCard'].forEach(id=>document.getElementById(id).style.display='none');
+    ['scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard'].forEach(id=>document.getElementById(id).style.display='none');
     return;
   }
 
@@ -844,6 +955,16 @@ function renderResult(res, symbol, interval, lastClosedTime){
   const riskCard = document.getElementById('riskCard');
   const riskContent = document.getElementById('riskContent');
   function planRows(p){
+    const capital = Math.max(+els.capitalInput.value || 0, 0);
+    const riskPct = Math.min(Math.max(+els.riskPctInput.value || 0, 0), 100);
+    const riskAmountUSDT = capital * riskPct / 100;
+    const perUnitRisk = Math.abs(p.entry - p.stopLoss);
+    const posSizing = (capital>0 && riskPct>0 && perUnitRisk>0) ? {
+      riskAmountUSDT: +riskAmountUSDT.toFixed(2),
+      units: +(riskAmountUSDT / perUnitRisk).toFixed(6),
+      positionValueUSDT: +((riskAmountUSDT / perUnitRisk) * p.entry).toFixed(2)
+    } : null;
+    p.positionSizing = posSizing; // برای گنجاندن در dataSummary ارسالی به AI
     return `
       <div class="row"><span>نقطه ورود (Entry)</span><span>${p.entry.toFixed(4)}</span></div>
       <div class="row"><span>حد ضرر (Stop Loss)</span><span>${p.stopLoss.toFixed(4)}</span></div>
@@ -851,6 +972,8 @@ function renderResult(res, symbol, interval, lastClosedTime){
       <div class="row"><span>حد سود ۲ (TP2)</span><span>${p.takeProfit2.toFixed(4)} (R:R ${p.riskRewardTP2})</span></div>
       <div class="row"><span>حد سود ۳ (TP3)</span><span>${p.takeProfit3.toFixed(4)} (R:R ${p.riskRewardTP3})</span></div>
       <div class="row"><span>لوریج پیشنهادی (آموزشی)</span><span>${p.suggestedLeverage}</span></div>
+      ${posSizing ? `<div class="row"><span>سایز پوزیشن (بر اساس سرمایه/ریسک واردشده)</span><span>${posSizing.units} واحد (${posSizing.positionValueUSDT} USDT)</span></div>
+      <p class="muted">با سرمایهٔ ${capital} USDT و ریسک ${riskPct}٪، حداکثر ضرر مجاز این ترید ${posSizing.riskAmountUSDT} USDT است.</p>` : '<p class="muted">برای محاسبهٔ سایز پوزیشن، سرمایه و درصد ریسک را از هدر بالا وارد کن.</p>'}
       <p class="muted" style="margin-top:6px">${p.estimatedFeeNote}</p>`;
   }
   if(res.risk || res.watchLong || res.watchShort){
@@ -906,6 +1029,26 @@ function renderResult(res, symbol, interval, lastClosedTime){
     ? [chartTag, candleTags].filter(Boolean).join(' ')
     : '<span class="muted">پترن قابل‌اتکایی در کندل‌های اخیر شناسایی نشد</span>';
 
+  const waveCard = document.getElementById('waveCard');
+  if(res.waveEngine){
+    waveCard.style.display='block';
+    const we = res.waveEngine;
+    let wh = `<div class="row"><span>فشار صعودی (Bullish Pressure)</span><span>${we.bullishPressure}/۱۰۰</span></div>`;
+    wh += `<div class="row"><span>فشار نزولی (Bearish Pressure)</span><span>${we.bearishPressure}/۱۰۰</span></div>`;
+    wh += `<div class="row"><span>نتیجهٔ کلی</span><span>${we.overall}</span></div>`;
+    wh += `<div class="row"><span>شتاب موج صعودی</span><span>${we.upAcceleration}</span></div>`;
+    wh += `<div class="row"><span>شتاب موج نزولی</span><span>${we.downAcceleration}</span></div>`;
+    wh += `<div class="row"><span>روند فاصلهٔ پیوت‌ها</span><span>${we.pivotTrend}</span></div>`;
+    wh += '<p class="muted" style="margin-top:8px">آخرین موج‌ها (جدیدترین در پایین):</p><ul>';
+    we.waves.forEach(w=>{
+      wh += `<li>${w.dir==='up'?'صعودی ⬆':'نزولی ⬇'} ${w.priceDispPct}% در ${w.duration} کندل — قدرت: ${w.strength} (بازده نرمال‌شده با ATR: ${w.efficiencyNorm})</li>`;
+    });
+    wh += '</ul><p class="muted">⚠ این فقط «فشار» جهت احتمالی شکست است، نه تأیید شکست؛ تا زمانی که کندل واقعاً بیرون از سطح/الگو بسته نشود، سیگنال ورود از این بخش استخراج نکن.</p>';
+    document.getElementById('waveContent').innerHTML = wh;
+  } else {
+    waveCard.style.display='none';
+  }
+
   document.getElementById('reasonCard').style.display='block';
   document.getElementById('reasonText').innerHTML = '<ul>' + res.notes.map(n=>`<li>${n}</li>`).join('') + '</ul>';
 
@@ -939,7 +1082,8 @@ async function maybeCallAI(res, symbol, interval){
     orderBlock: res.orderBlock, fairValueGaps: res.fvgs, liquidity: res.liquidity,
     resistances: res.resistances, supports: res.supports,
     patterns: res.patterns.map(p=>p.name),
-    chartPattern: res.chartPattern, // کانال/مثلث/گوه شناسایی‌شده روی سوئینگ‌های اخیر (یا null)
+    chartPattern: res.chartPattern,
+    waveStrengthEngine: res.waveEngine, // موج‌های اخیر با قدرت/شتاب/فشار شکست صعودی و نزولی (0-100) // کانال/مثلث/گوه شناسایی‌شده روی سوئینگ‌های اخیر (یا null)
     recentSwingHighs: res.recentSwingHighs, // آخرین قله‌های سوئینگ واقعی (برای بررسی دبل‌تاپ/سر-و-شانه و... توسط AI)
     recentSwingLows: res.recentSwingLows,  // آخرین دره‌های سوئینگ واقعی (برای بررسی دبل‌باتم و...)
     volumeNote: res.notes.find(n=>n.includes('حجم')),
@@ -1007,7 +1151,14 @@ async function maybeCallAI(res, symbol, interval){
 - در هیچ حالتی صفحه/پاسخ نباید بدون بخش «ستاپ» بماند — همیشه حداقل یک سناریوی شرطی (ولو ضعیف) یا دلیل روشن نبود آن (مثلاً نبود resistances/supports معتبر) باید ذکر شود.
 - تمام اعداد این بخش را فقط از suggestedRiskManagement / watchLongScenario / watchShortScenario بردار، هرگز عدد جدید نساز. اگر قیمت از ناحیهٔ ورود ایدئال دور افتاده، بنویس «دیر شده — منتظر پولبک بمان»، هرگز ورود دیرهنگام را توصیه نکن.
 
-## دامنهٔ داده‌های در دسترس‌نبوده (صادقانه اعلام کن، حدس نزن)
+## موتور قدرت موج (Wave Strength Engine)
+فیلد waveStrengthEngine (اگر null نباشد) موج‌های اخیر قیمتی را با معیار عینی (جابه‌جایی قیمت٪، تعداد کندل، بازدهی نرمال‌شده با ATR) اندازه‌گیری کرده و دو عدد «فشار شکست صعودی/نزولی» (۰ تا ۱۰۰) داده است.
+- این عدد «فشار» است، نه «تأیید شکست». هرگز فشار بالا را معادل ENTRY یا شکست تأییدشده معرفی نکن؛ فقط بگو کدام جهت مومنتوم قوی‌تری دارد و آیا این مومنتوم در حال شتاب‌گرفتن یا افت است.
+- اگر قیمت مدام سقف بالاتر می‌سازد ولی efficiency/دامنهٔ موج‌ها رو به کاهش است (واگرایی قدرت موج از قیمت)، این را صراحتاً به‌عنوان هشدار ضعیف‌شدن روند/احتمال توزیع یا شکست ناموفق ذکر کن.
+
+## موتور مدیریت ریسک حرفه‌ای (سایز پوزیشن)
+اگر positionSizing در داده پر بود، سایز پوزیشن (مقدار واحد دارایی و ارزش دلاری) را دقیقاً از همان اعداد گزارش کن؛ این بر اساس سرمایه و درصد ریسک واردشدهٔ کاربر و فاصلهٔ Entry تا Stop Loss محاسبه شده، نه فرض دلخواه.
+
 Harmonic Patterns (Gartley/Bat/Butterfly/Crab/...)، Elliott Wave، Volume Profile (POC/VAH/VAL)، Order Flow، Open Interest، Funding Rate، Liquidations، اخبار/فاندامنتال زنده و داده آن‌چین در این پلتفرم محاسبه نمی‌شوند. اگر کاربر این‌ها را خواست یا فکر کردی مرتبط است، فقط بنویس «این داده روی این پلتفرم در دسترس نیست» — هرگز مقدار نساز.
 
 

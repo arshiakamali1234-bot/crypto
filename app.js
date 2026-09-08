@@ -707,34 +707,44 @@ function analyze(candles, htfCandles){
     verdict = 'HOLD — عدم قطعیت / سیگنال‌های متضاد، وارد پوزیشن نشوید'; verdictClass='v-hold';
   }
 
-  // --- مدیریت ریسک: پیشنهاد حد ضرر/سود بر اساس ATR و نزدیک‌ترین S/R ---
-  let risk = null;
-  if(dataQualityOK && (verdictClass==='v-buy' || verdictClass==='v-sell')){
-    const dir = verdictClass==='v-buy' ? 1 : -1;
-    const slByATR = lastClose - dir*atrVal*1.5;
+  // --- مدیریت ریسک: ستاپ معاملاتی (فعال وقتی سیگنال قاطع است، وگرنه سناریوی شرطی/در انتظار) ---
+  function buildPlan(dir, entryPrice, isActive){
+    const slByATR = entryPrice - dir*atrVal*1.5;
     const slBySR = dir===1 ? (nearestSup ?? slByATR) : (nearestRes ?? slByATR);
     const stopLoss = dir===1 ? Math.min(slByATR, slBySR) : Math.max(slByATR, slBySR);
-    const riskAmount = Math.abs(lastClose - stopLoss);
-    const takeProfit1 = lastClose + dir*riskAmount*1.5;
-    const takeProfit2 = lastClose + dir*riskAmount*2.5;
-    // TP3: تا نزدیک‌ترین سطح ساختاری بعدی (اگر معنادار بود) وگرنe بر مبنای ATR/RR=4
+    const riskAmount = Math.abs(entryPrice - stopLoss);
+    if(riskAmount <= 0) return null;
+    const takeProfit1 = entryPrice + dir*riskAmount*1.5;
+    const takeProfit2 = entryPrice + dir*riskAmount*2.5;
     const structuralTP3 = dir===1
       ? resistances.find(r=>r.price > takeProfit2)?.price
       : supports.find(s=>s.price < takeProfit2)?.price;
-    const takeProfit3 = structuralTP3 ?? (lastClose + dir*riskAmount*4);
-    // --- پیشنهاد لوریج (صرفاً آموزشی؛ بر اساس نوسان ATR% و کیفیت سیگنال، محافظه‌کارانه) ---
+    const takeProfit3 = structuralTP3 ?? (entryPrice + dir*riskAmount*4);
     const atrPct = (atrVal / lastClose) * 100;
     let suggestedLeverage;
     if(confidence < 40 || atrPct > 4) suggestedLeverage = '۱x تا ۳x (نوسان بالا/اطمینان پایین — لوریج پایین یا اسپات)';
     else if(confidence < 65 || atrPct > 2) suggestedLeverage = '۳x تا ۵x (احتیاط، ریسک هر ترید را حداکثر ۱-۲٪ سرمایه نگه دار)';
     else suggestedLeverage = '۵x تا ۱۰x (حداکثر پیشنهادی؛ حتی در بهترین ستاپ بالاتر از این توصیه نمی‌شود)';
-    risk = {
-      entry: lastClose, stopLoss, takeProfit1, takeProfit2, takeProfit3,
+    return {
+      direction: dir===1 ? 'LONG' : 'SHORT',
+      active: isActive,
+      entry: entryPrice, stopLoss, takeProfit1, takeProfit2, takeProfit3,
       riskRewardTP1: 1.5, riskRewardTP2: 2.5,
-      riskRewardTP3: +(Math.abs(takeProfit3-lastClose)/riskAmount).toFixed(2),
+      riskRewardTP3: +(Math.abs(takeProfit3-entryPrice)/riskAmount).toFixed(2),
       suggestedLeverage,
-      estimatedFeeNote: 'کارمزد نمونه بایننس (Taker): اسپات ~۰.۱٪ | فیوچرز ~۰.۰۴٪-۰.۰۵٪ در هر پا (ورود+خروج جمعاً دو برابر) — درصد واقعی به سطح تخفیف/VIP حساب شما بستگی دارد و اینجا محاسبه‌شده از داده زنده نیست.'
+      estimatedFeeNote: 'کارمزد نمونه بایننس (Taker): اسپات ~۰.۱٪ | فیوچرز ~۰.۰۴٪-۰.۰۵٪ در هر پا (ورود+خروج جمعاً دو برابر) — درصد واقعی به سطح تخفیف/VIP حساب شما بستگی دارد.'
     };
+  }
+
+  let risk = null;         // ستاپ فعال (Entry الان) — فقط وقتی سیگنال قاطع باشد
+  let watchLong = null, watchShort = null; // سناریوهای شرطی (Primary/Alternative) — همیشه در صورت وجود سطح معتبر محاسبه می‌شوند
+  if(dataQualityOK){
+    if(verdictClass==='v-buy'){ risk = buildPlan(1, lastClose, true); risk.state = 5; risk.entryState = 'ENTRY VALID'; }
+    else if(verdictClass==='v-sell'){ risk = buildPlan(-1, lastClose, true); risk.state = 5; risk.entryState = 'ENTRY VALID'; }
+    // سناریوی شرطی صعودی: اگر قیمت نزدیک‌ترین حمایت را لمس/رد کند یا نزدیک‌ترین مقاومت را بشکند
+    if(nearestSup){ watchLong = buildPlan(1, nearestSup, false); if(watchLong){ watchLong.trigger = `واکنش صعودی از حمایت ${nearestSup.toFixed(4)} یا شکست تأییدشدهٔ مقاومت ${ (nearestRes??nearestSup).toFixed(4) }`; watchLong.state = (Math.abs(lastClose-nearestSup)/lastClose*100 < 0.5) ? 2 : 1; watchLong.entryState = watchLong.state===2 ? 'LEVEL TOUCHED' : 'APPROACHING LEVEL'; } }
+    // سناریوی شرطی نزولی: اگر قیمت نزدیک‌ترین مقاومت را رد کند یا نزدیک‌ترین حمایت را بشکند
+    if(nearestRes){ watchShort = buildPlan(-1, nearestRes, false); if(watchShort){ watchShort.trigger = `رد شدن از مقاومت ${nearestRes.toFixed(4)} یا شکست تأییدشدهٔ حمایت ${ (nearestSup??nearestRes).toFixed(4) }`; watchShort.state = (Math.abs(nearestRes-lastClose)/lastClose*100 < 0.5) ? 2 : 1; watchShort.entryState = watchShort.state===2 ? 'LEVEL TOUCHED' : 'APPROACHING LEVEL'; } }
   }
 
   // --- نقاط سوئینگ اخیر (برای امکان تشخیص الگوهایی مثل دبل‌تاپ/باتم و سر-و-شانه توسط AI، فقط از داده واقعی) ---
@@ -745,7 +755,7 @@ function analyze(candles, htfCandles){
   return {
     lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
     fib, vwapVal, structure, orderBlock, fvgs, liquidity,
-    resistances, supports, patterns, chartPattern, recentSwingHighs, recentSwingLows, notes, score, verdict, verdictClass, confidence, risk,
+    resistances, supports, patterns, chartPattern, recentSwingHighs, recentSwingLows, notes, score, verdict, verdictClass, confidence, risk, watchLong, watchShort,
     trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore, liqScore
   };
 }
@@ -786,18 +796,39 @@ function renderResult(res, symbol, interval){
   }
 
   const riskCard = document.getElementById('riskCard');
-  if(res.risk){
+  const riskContent = document.getElementById('riskContent');
+  function planRows(p){
+    return `
+      <div class="row"><span>نقطه ورود (Entry)</span><span>${p.entry.toFixed(4)}</span></div>
+      <div class="row"><span>حد ضرر (Stop Loss)</span><span>${p.stopLoss.toFixed(4)}</span></div>
+      <div class="row"><span>حد سود ۱ (TP1)</span><span>${p.takeProfit1.toFixed(4)} (R:R ${p.riskRewardTP1})</span></div>
+      <div class="row"><span>حد سود ۲ (TP2)</span><span>${p.takeProfit2.toFixed(4)} (R:R ${p.riskRewardTP2})</span></div>
+      <div class="row"><span>حد سود ۳ (TP3)</span><span>${p.takeProfit3.toFixed(4)} (R:R ${p.riskRewardTP3})</span></div>
+      <div class="row"><span>لوریج پیشنهادی (آموزشی)</span><span>${p.suggestedLeverage}</span></div>
+      <p class="muted" style="margin-top:6px">${p.estimatedFeeNote}</p>`;
+  }
+  if(res.risk || res.watchLong || res.watchShort){
     riskCard.style.display='block';
-    document.getElementById('r_entry').textContent = res.risk.entry.toFixed(4);
-    document.getElementById('r_sl').textContent = res.risk.stopLoss.toFixed(4);
-    document.getElementById('r_tp1').textContent = `${res.risk.takeProfit1.toFixed(4)} (R:R ${res.risk.riskRewardTP1})`;
-    document.getElementById('r_tp2').textContent = `${res.risk.takeProfit2.toFixed(4)} (R:R ${res.risk.riskRewardTP2})`;
-    const tp3El = document.getElementById('r_tp3');
-    if(tp3El) tp3El.textContent = `${res.risk.takeProfit3.toFixed(4)} (R:R ${res.risk.riskRewardTP3})`;
-    const levEl = document.getElementById('r_leverage');
-    if(levEl) levEl.textContent = res.risk.suggestedLeverage;
-    const feeEl = document.getElementById('r_fee');
-    if(feeEl) feeEl.textContent = res.risk.estimatedFeeNote;
+    let html = '';
+    if(res.risk){
+      html += `<div class="verdict ${res.risk.direction==='LONG'?'v-buy':'v-sell'}" style="font-size:14px;padding:8px;margin-bottom:8px">
+        🎯 ستاپ فعال — ${res.risk.direction} (STATE ${res.risk.state}: ${res.risk.entryState})</div>`;
+      html += planRows(res.risk);
+    } else {
+      html += `<p class="muted" style="margin-bottom:8px">⚪ در حال حاضر سیگنال قاطعی صادر نشده (STATE 0-3: هنوز TRIGGER تأیید نشده) — بنابراین «ورود الان» توصیه نمی‌شود. سناریوهای شرطی زیر را زیر نظر بگیر:</p>`;
+      if(res.watchLong){
+        html += `<h3 style="margin-top:10px">🟡 سناریوی شرطی LONG (${res.watchLong.entryState})</h3>
+          <p class="muted">تریگر لازم: ${res.watchLong.trigger}</p>` + planRows(res.watchLong);
+      }
+      if(res.watchShort){
+        html += `<h3 style="margin-top:10px">🟠 سناریوی شرطی SHORT (${res.watchShort.entryState})</h3>
+          <p class="muted">تریگر لازم: ${res.watchShort.trigger}</p>` + planRows(res.watchShort);
+      }
+      if(!res.watchLong && !res.watchShort){
+        html += `<p class="muted">سطح حمایت/مقاومت معتبری برای تعریف سناریوی شرطی شناسایی نشد — داده ناکافی است.</p>`;
+      }
+    }
+    riskContent.innerHTML = html;
   } else {
     riskCard.style.display='none';
   }
@@ -875,7 +906,9 @@ async function maybeCallAI(res, symbol, interval){
     totalConfluenceScore: res.score,
     confidencePercent: res.confidence,
     ruleBasedVerdict: res.verdict,
-    suggestedRiskManagement: res.risk,
+    suggestedRiskManagement: res.risk, // فقط وقتی سیگنال قاطع (STATE 5) است پر است
+    watchLongScenario: res.watchLong,  // سناریوی شرطی صعودی (STATE 1 یا 2) با entry/SL/TP و trigger مورد نیاز
+    watchShortScenario: res.watchShort, // سناریوی شرطی نزولی
     // داده‌هایی که این پلتفرم به آن‌ها دسترسی ندارد — AI موظف است برای همین موارد صراحتاً بگوید «داده در دسترس نیست»
     notAvailable: ['Order Flow', 'Open Interest', 'Funding Rate', 'Long/Short Ratio', 'اخبار/رویدادهای فاندامنتال']
   };
@@ -922,19 +955,14 @@ async function maybeCallAI(res, symbol, interval){
 - تارگت الگو را فقط با فرمول کلاسیک اندازه‌گیری‌شده (فاصلهٔ الگو تا نکلاین، تصویر شده در جهت شکست) حساب کن، نه عدد دلخواه؛ اگر نمی‌توانی این فاصله را از داده‌های موجود دقیق حساب کنی، بنویس «تارگت الگو قابل‌محاسبهٔ دقیق نیست، به سطوح S/R واقعی رجوع کن».
 - اگر chartPattern (کانال/مثلث) و یک الگوی کلاسیک دیگر هم‌زمان با هم هم‌راستا بودند، آن را confluence مثبت اعلام کن؛ اگر متناقض بودند، صریحاً تناقض را بگو و اعتماد را کم کن.
 
-## ستاپ ورود نهایی (اجباری — دقیقاً با همین ساختار در انتهای پاسخ بیاور)
-اگر verdict یک سیگنال قاطع (BUY/SELL) بود و suggestedRiskManagement (فیلد risk در داده) مقدار دارد، این جدول را دقیقاً از همان اعداد پر کن (هیچ عدد جدیدی نساز):
+## ستاپ ورود نهایی (اجباری — همیشه، فارغ از قاطع بودن یا نبودن سیگنال، این بخش باید در پاسخ باشد)
+- اگر suggestedRiskManagement مقدار داشت (یعنی STATE=5، سیگنال قاطع BUY/SELL): این را «ستاپ فعال» بنویس با: جهت، Entry، کارمزد تخمینی (از estimatedFeeNote)، Stop Loss، TP1/TP2/TP3 با R:R هرکدام، لوریج پیشنهادی (از suggestedLeverage) — همراه با یادآوری که لوریج صرفاً آموزشی است و توصیهٔ مالی نیست.
+- اگر suggestedRiskManagement خالی بود (سیگنال HOLD/ضعیف است): به‌جایش watchLongScenario و/یا watchShortScenario را به‌عنوان «سناریوی شرطی (PRIMARY/ALTERNATIVE)» با همان ساختار (Entry/SL/TP1/TP2/TP3/لوریج) به‌علاوهٔ فیلد trigger (شرط لازم برای معتبر شدن) و entryState (APPROACHING LEVEL یا LEVEL TOUCHED) بنویس. این را IF/THEN بنویس، مثلاً: «IF قیمت trigger را با کندل بسته و حجم تأیید کند THEN سناریو معتبر می‌شود، در غیر این صورت WAIT».
+- در هیچ حالتی صفحه/پاسخ نباید بدون بخش «ستاپ» بماند — همیشه حداقل یک سناریوی شرطی (ولو ضعیف) یا دلیل روشن نبود آن (مثلاً نبود resistances/supports معتبر) باید ذکر شود.
+- تمام اعداد این بخش را فقط از suggestedRiskManagement / watchLongScenario / watchShortScenario بردار، هرگز عدد جدید نساز. اگر قیمت از ناحیهٔ ورود ایدئال دور افتاده، بنویس «دیر شده — منتظر پولبک بمان»، هرگز ورود دیرهنگام را توصیه نکن.
 
-**ستاپ معاملاتی پیشنهادی**
-- جهت: LONG یا SHORT
-- نقطهٔ ورود (Entry): از risk.entry
-- کارمزد تخمینی (Entry Fee note): از risk.estimatedFeeNote — فقط به‌عنوان یادآوری، نه عدد قطعی چون به تعرفهٔ حساب کاربر بستگی دارد
-- حد ضرر (Stop Loss): از risk.stopLoss
-- حد سود ۱ (Take Profit 1): از risk.takeProfit1 با R:R آن
-- حد سود ۲ (Take Profit 2): از risk.takeProfit2 با R:R آن
-- حد سود ۳ (Take Profit 3): از risk.takeProfit3 با R:R آن
-- لوریج پیشنهادی: از risk.suggestedLeverage — با یادآوری صریح که این عدد صرفاً آموزشی است، نه توصیهٔ مالی، و لوریج بالا ریسک لیکوییدشدن را به‌شدت افزایش می‌دهد.
-اگر risk وجود نداشت (یعنی سیگنال HOLD/NO TRADE بود)، این بخش را ننویس و به‌جایش بگو چرا شرایط برای تعریف ستاپ ورود کافی نیست.
+## دامنهٔ داده‌های در دسترس‌نبوده (صادقانه اعلام کن، حدس نزن)
+Harmonic Patterns (Gartley/Bat/Butterfly/Crab/...)، Elliott Wave، Volume Profile (POC/VAH/VAL)، Order Flow، Open Interest، Funding Rate، Liquidations، اخبار/فاندامنتال زنده و داده آن‌چین در این پلتفرم محاسبه نمی‌شوند. اگر کاربر این‌ها را خواست یا فکر کردی مرتبط است، فقط بنویس «این داده روی این پلتفرم در دسترس نیست» — هرگز مقدار نساز.
 
 
 - هرگز نگو «۱۰۰٪ مطمئن»، «تضمینی» یا «بدون ریسک».

@@ -751,7 +751,7 @@ function wavePressureV2(candles,atrVal,pattern,structure,vol){
   const piv=structure?.pivots||[]; if(piv.length<4||!atrVal)return null;
   const waves=[]; for(let i=1;i<piv.length;i++){
     const a=piv[i-1],b=piv[i], dur=Math.max(1,b.i-a.i), disp=b.price-a.price;
-    waves.push({dir:disp>0?'up':'down',dispPct:disp/a.price*100,duration,eff:Math.abs(disp)/(atrVal*dur)});
+    waves.push({dir:disp>0?'up':'down',dispPct:disp/a.price*100,duration:dur,eff:Math.abs(disp)/(atrVal*dur)});
   }
   const last=waves.at(-1); const ups=waves.filter(w=>w.dir==='up'), downs=waves.filter(w=>w.dir==='down');
   const avg=x=>x.length?x.reduce((a,b)=>a+b.eff,0)/x.length:0;

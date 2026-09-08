@@ -401,6 +401,88 @@ function clusterLevels(levels, tolerancePct=0.15){
   return clusters.map(c=>({price:c.avg, strength:c.vals.length})).sort((a,b)=>b.strength-a.strength);
 }
 
+// ---------- رگرسیون خطی ساده (برای خطوط روند کانال/مثلث) ----------
+function linReg(points){
+  const n = points.length;
+  const sumX = points.reduce((a,p)=>a+p.x,0);
+  const sumY = points.reduce((a,p)=>a+p.y,0);
+  const sumXY = points.reduce((a,p)=>a+p.x*p.y,0);
+  const sumXX = points.reduce((a,p)=>a+p.x*p.x,0);
+  const denom = (n*sumXX - sumX*sumX) || 1;
+  const slope = (n*sumXY - sumX*sumY) / denom;
+  const intercept = (sumY - slope*sumX) / n;
+  return { slope, intercept };
+}
+
+// ---------- تشخیص کانال‌ها و مثلث‌ها (بر اساس خطوط برازش‌شده روی سوئینگ‌های اخیر) ----------
+function detectChartPatterns(candles, lookback=3, minSwings=3){
+  const n = candles.length;
+  const highsIdx=[], lowsIdx=[];
+  for(let i=lookback;i<n-lookback;i++){
+    const win = candles.slice(i-lookback, i+lookback+1);
+    const cur = candles[i];
+    if(cur.high === Math.max(...win.map(c=>c.high))) highsIdx.push({x:i, y:cur.high});
+    if(cur.low === Math.min(...win.map(c=>c.low))) lowsIdx.push({x:i, y:cur.low});
+  }
+  const recentHighs = highsIdx.slice(-5);
+  const recentLows = lowsIdx.slice(-5);
+  if(recentHighs.length < minSwings || recentLows.length < minSwings) return null;
+
+  const upper = linReg(recentHighs);
+  const lower = linReg(recentLows);
+  const lastIdx = n-1;
+  const lastClose = candles[n-1].close;
+  const upperNow = upper.slope*lastIdx + upper.intercept;
+  const lowerNow = lower.slope*lastIdx + lower.intercept;
+  if(upperNow <= lowerNow) return null; // خطوط نامعتبر (تقاطع اشتباه)
+
+  const widthNow = upperNow - lowerNow;
+  const startX = Math.min(recentHighs[0].x, recentLows[0].x);
+  const upperStart = upper.slope*startX + upper.intercept;
+  const lowerStart = lower.slope*startX + lower.intercept;
+  const widthStart = Math.max(upperStart - lowerStart, 1e-9);
+
+  const avgPrice = (upperNow+lowerNow)/2;
+  const slopeThreshold = avgPrice * 0.0006; // برای تشخیص «تقریباً افقی»
+
+  const upFlat = Math.abs(upper.slope) < slopeThreshold;
+  const lowFlat = Math.abs(lower.slope) < slopeThreshold;
+  const upUp = upper.slope > slopeThreshold;
+  const upDown = upper.slope < -slopeThreshold;
+  const lowUp = lower.slope > slopeThreshold;
+  const lowDown = lower.slope < -slopeThreshold;
+
+  let type=null, dirBias='neutral';
+  const converging = widthNow < widthStart*0.85;
+  const diverging = widthNow > widthStart*1.15;
+
+  if(converging){
+    if(upFlat && lowUp){ type='مثلث صعودی (Ascending Triangle)'; dirBias='up'; }
+    else if(upDown && lowFlat){ type='مثلث نزولی (Descending Triangle)'; dirBias='down'; }
+    else if(upDown && lowUp){ type='مثلث متقارن (Symmetrical Triangle)'; dirBias='neutral'; }
+    else if(upDown && lowDown){ type='کانال نزولی همگرا (Falling Wedge)'; dirBias='up'; }
+    else if(upUp && lowUp){ type='کانال صعودی همگرا (Rising Wedge)'; dirBias='down'; }
+  } else if(diverging){
+    type='الگوی گسترش‌یابنده / بادبزنی (Broadening Formation)'; dirBias='neutral';
+  } else {
+    if(upUp && lowUp){ type='کانال صعودی (Ascending Channel)'; dirBias='up'; }
+    else if(upDown && lowDown){ type='کانال نزولی (Descending Channel)'; dirBias='down'; }
+    else if(upFlat && lowFlat){ type='کانال رنج / محدوده خنثی (Horizontal Range)'; dirBias='neutral'; }
+  }
+  if(!type) return null;
+
+  let status, breakout=null;
+  if(lastClose > upperNow){ status='شکست به بالای خط بالایی الگو (Breakout بالقوه — نیازمند تأیید کندل بسته و حجم)'; breakout='up'; }
+  else if(lastClose < lowerNow){ status='شکست به پایین خط پایینی الگو (Breakdown بالقوه — نیازمند تأیید کندل بسته و حجم)'; breakout='down'; }
+  else status='قیمت هنوز داخل الگو در حال نوسان است — بدون شکست تأییدشده';
+
+  return {
+    type, dirBias, status, breakout,
+    upperLineNow: +upperNow.toFixed(6), lowerLineNow: +lowerNow.toFixed(6),
+    upperSlope: upper.slope, lowerSlope: lower.slope
+  };
+}
+
 // ---------- تشخیص پترن‌های پرایس اکشن ----------
 function detectPatterns(candles){
   const patterns=[];
@@ -473,6 +555,7 @@ function analyze(candles, htfCandles){
   const supports = clusterLevels(lows.filter(l=>l<lastClose)).slice(0,3);
 
   const patterns = detectPatterns(candles);
+  const chartPattern = detectChartPatterns(candles);
 
   const volAvg = sma(volumes, 20);
   const volLast = volumes.at(-1);
@@ -511,6 +594,12 @@ function analyze(candles, htfCandles){
   // پرایس اکشن
   let paScore = 0;
   patterns.forEach(p=>{ if(p.dir==='up') paScore+=1; if(p.dir==='down') paScore-=1; });
+  if(chartPattern){
+    notes.push(`الگوی نموداری شناسایی‌شده: ${chartPattern.type} — ${chartPattern.status}`);
+    // فقط در صورت شکست تأییدشده (بسته‌شدن کندل بیرون از الگو) امتیاز می‌گیرد، نه صرفاً لمس خط
+    if(chartPattern.breakout==='up') paScore += 1;
+    else if(chartPattern.breakout==='down') paScore -= 1;
+  }
   score += paScore;
 
   // حجم
@@ -636,7 +725,7 @@ function analyze(candles, htfCandles){
   return {
     lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
     fib, vwapVal, structure, orderBlock, fvgs, liquidity,
-    resistances, supports, patterns, notes, score, verdict, verdictClass, confidence, risk,
+    resistances, supports, patterns, chartPattern, notes, score, verdict, verdictClass, confidence, risk,
     trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore, liqScore
   };
 }
@@ -706,8 +795,12 @@ function renderResult(res, symbol, interval){
   if(adxRow){ adxRow.style.display='flex'; document.getElementById('ind_adx').textContent = `${res.adxVal.adx.toFixed(1)} (${res.adxVal.adx>=25?'روند قوی':'رنج/ضعیف'})`; }
 
   document.getElementById('paCard').style.display='block';
-  document.getElementById('paPatterns').innerHTML = res.patterns.length
-    ? res.patterns.map(p=>`<span class="tag ${p.dir==='up'?'tag-up':p.dir==='down'?'tag-down':'tag-neu'}">${p.name}</span>`).join(' ')
+  const candleTags = res.patterns.map(p=>`<span class="tag ${p.dir==='up'?'tag-up':p.dir==='down'?'tag-down':'tag-neu'}">${p.name}</span>`).join(' ');
+  const chartTag = res.chartPattern
+    ? `<span class="tag ${res.chartPattern.dirBias==='up'?'tag-up':res.chartPattern.dirBias==='down'?'tag-down':'tag-neu'}" title="${res.chartPattern.status}">${res.chartPattern.type}</span>`
+    : '';
+  document.getElementById('paPatterns').innerHTML = (candleTags || chartTag)
+    ? [chartTag, candleTags].filter(Boolean).join(' ')
     : '<span class="muted">پترن قابل‌اتکایی در کندل‌های اخیر شناسایی نشد</span>';
 
   document.getElementById('reasonCard').style.display='block';
@@ -743,6 +836,7 @@ async function maybeCallAI(res, symbol, interval){
     orderBlock: res.orderBlock, fairValueGaps: res.fvgs, liquidity: res.liquidity,
     resistances: res.resistances, supports: res.supports,
     patterns: res.patterns.map(p=>p.name),
+    chartPattern: res.chartPattern, // کانال/مثلث/گوه شناسایی‌شده روی سوئینگ‌های اخیر (یا null)
     volumeNote: res.notes.find(n=>n.includes('حجم')),
     componentScores: {
       trend: res.trendScore, momentum: res.momScore, priceAction: res.paScore,
@@ -760,30 +854,46 @@ async function maybeCallAI(res, symbol, interval){
 
   aiText.textContent = 'در حال تحلیل توسط AI...';
 
-  const prompt = `تو یک Senior Crypto Market Analyst و Professional Technical Trader هستی.
+  const prompt = `تو یک Senior Crypto Market Structure Analyst هستی که طبق یک چارچوب قانون‌محور و محافظه‌کارانه کار می‌کند. هدف تو پیش‌بینی بازار نیست؛ هدف، فیلتر کردن سیگنال‌های کم‌ابهام و رد کردن بقیه است. «WAIT / NO TRADE» یک نتیجهٔ کاملاً معتبر و اغلب ترجیحی است، نه شکست تحلیل.
 
-وظیفه‌ات تحلیل دقیق و چندلایه بازار ارز دیجیتال ${symbol} است، فقط و فقط بر اساس داده‌های JSON زیر که همگی از محاسبات واقعی روی کندل‌های زنده (Binance) به‌دست آمده‌اند — نه حدس، نه دانش عمومی قبلی، نه پیش‌بینی اخبار.
+## محدودیت حیاتی داده (اجباری، بدون استثنا)
+تمام اعداد، سطوح، اندیکاتورها و پترن‌های زیر **از قبل روی کندل‌های واقعی و زندهٔ Binance محاسبه شده‌اند** و در JSON انتهای پیام (dataSummary) آمده‌اند.
+- هیچ عدد/قیمت/سطح/رویدادی که در JSON نیست اختراع نکن.
+- فیلد notAvailable نشان می‌دهد Order Flow، Open Interest، Funding Rate، Long/Short Ratio و اخبار فاندامنتال در دسترس نیستند — برای این موارد فقط بنویس «داده در دسترس نیست» و هرگز ادعای Whale Activity یا Smart Money بدون مبنای واقعی نکن.
+- اگر dataQuality پرچم مشکل داشت یا اعداد به‌هم نمی‌خوردند، بنویس «DATA SYNCHRONIZATION ERROR» و به NO TRADE برو.
+- تایم‌فریم کاری فعلی workingInterval است؛ داده مولتی‌تایم‌فریم در multiTimeframeAnalysis (1d/4h/1h/15m/5m در صورت وجود) آمده. هر عددی که از یک تایم‌فریم می‌آوری را برچسب‌گذاری کن، هرگز اندیکاتورهای تایم‌فریم‌های مختلف را بی‌برچسب قاطی نکن.
 
-## قوانین اصلی (اجباری)
-- هرگز صرفاً بر اساس یک اندیکاتور یا یک سیگنال نتیجه‌گیری نکن؛ ترکیب همه داده‌های زیر را در نظر بگیر: Market Structure، Price Action، Support/Resistance، Trend، Volume، Volatility، Liquidity، RSI، MACD، EMA، VWAP، Bollinger Bands، Fibonacci، Divergence، Candlestick Patterns، Fair Value Gap، Liquidity Sweep، Order Block.
-- فیلد notAvailable در داده مشخص می‌کند این موارد (Order Flow، Open Interest، Funding Rate، Long/Short Ratio، اخبار) در دسترس نیستند — برای این موارد صراحتاً بنویس «داده در دسترس نیست» و هرگز حدس نزن یا ادعای Whale Activity/Smart Money بدون داده واقعی نکن.
-- هیچ عدد، قیمت یا رویدادی که در JSON نیست اختراع نکن.
+## اصل اصلی
+سیگنال معتبر فقط وقتی صادر می‌شود که: Context بازار + ساختار بازار (marketStructure) + سطح کلیدی (resistances/supports/fibonacci) + پرایس‌اکشن (patterns) + الگوی نموداری (chartPattern: کانال/مثلث/گوه، در صورت وجود) + تریگر ورود + تأیید (حجم/مومنتوم) + ریسک به ریوارد قابل‌قبول همگی هم‌راستا باشند. اگر یکی از این‌ها ناقص یا متناقض بود → WAIT.
 
-## تحلیل چند تایم‌فریمی (اجباری)
-فیلد multiTimeframeAnalysis روند مستقل هر تایم‌فریم (1d, 4h, 1h, 15m, 5m) را می‌دهد. طبق ترتیب اهمیت 1D → 4H → 1H → 15M → 5M عمل کن: از تایم‌فریم‌های بالا روند اصلی، از تایم‌فریم‌های پایین‌تر (که workingInterval معمولاً بین آن‌هاست) نقطه ورود را استخراج کن. اگر تایم‌فریم پایین‌تر برخلاف تایم‌فریم بالاتر سیگنال داد، آن را سیگنال ضعیف‌تر در نظر بگیر و صریح اعلام کن.
+## نکات مهم برای الگوهای نموداری (کانال و مثلث)
+فیلد chartPattern (اگر null نباشد) نتیجهٔ برازش خط روند روی سوئینگ‌های اخیر است: type (مثلاً «مثلث صعودی»، «کانال نزولی»، «Rising/Falling Wedge»، «Broadening Formation»)، dirBias (سوگیری جهتی الگو)، status (آیا هنوز داخل الگوست یا شکسته)، upperLineNow/lowerLineNow (قیمت لحظه‌ای دو خط روند).
+- هرگز فقط لمس خط روند را «شکست» تلقی نکن؛ فقط وقتی status نشان‌دهندهٔ breakout/breakdown است می‌توانی به آن به‌عنوان تریگر احتمالی اشاره کنی، و باز هم باید با حجم/کندل بسته‌شده تأیید شود (که در dataSummary نیست، پس صراحتاً بنویس «نیازمند تأیید کندل بعدی/حجم»).
+- مثلث‌ها و کانال‌های همگرا (Wedge) را با احتیاط بیشتری تحلیل کن؛ فقط چون قیمت نزدیک رأس مثلث است دلیل بر شکست قریب‌الوقوع در جهت خاص نیست.
 
-## ساختار خروجی (دقیقاً به این ترتیب و به فارسی روان بنویس)
-1. **Market Structure**: روند هر تایم‌فریم اصلی (از multiTimeframeAnalysis)، HH/HL یا LH/LL، آخرین BOS/CHoCH (از marketStructure)، و آیا شکست معتبر بوده یا احتمال Fake Breakout.
-2. **حمایت و مقاومت کلیدی**: فقط سطوح مهم (از resistances/supports)، با قیمت دقیق و قدرت هر سطح.
-3. **Price Action**: پترن‌های شناسایی‌شده (از patterns) را در Context ساختار بازار توضیح بده، نه فقط نام‌شان.
-4. **اندیکاتورها**: خلاصه RSI (شامل rsiDivergence)، MACD، EMA/SMA (شیب و Cross)، Bollinger (Squeeze/Expansion) — همه از داده واقعی.
-5. **Fibonacci**: سطوح کلیدی (fibonacci.levels) و هم‌پوشانی آن‌ها با S/R یا ساختار بازار.
-6. **Volume & Momentum**: از volumeNote و componentScores.
-7. **Liquidity & Smart Money**: از orderBlock، fairValueGaps، liquidity (Equal Highs/Lows، Sweep) — فقط با داده موجود، بدون ادعای بدون‌مبنا.
-8. **سناریوهای معاملاتی**: حداقل دو سناریو (LONG و SHORT) با Entry Zone، Trigger، Confirmation، Stop Loss، TP1، TP2، Risk/Reward — این اعداد را فقط از suggestedRiskManagement و سطوح S/R/Fibonacci واقعی بردار، عدد جدید نساز. اگر confidencePercent پایین (زیر ۴۰) یا ruleBasedVerdict نامشخص/HOLD است، سناریوها را به‌صورت شرطی ("اگر قیمت X را بشکند...") بنویس، نه توصیه قطعی.
-9. **جمع‌بندی نهایی**: یک جمله صریح — سیگنال معتبر و قابل‌اتکاست یا باید صبر کرد؟ و یادآوری کوتاه که این توصیه مالی قطعی نیست.
+## چارچوب تحلیل (این ترتیب را رعایت کن، در خروجی نهایی خلاصه‌شده و به فارسی روان بنویس)
+1. **Market Regime**: بر اساس multiTimeframeAnalysis روند هر تایم‌فریم (4H بالاتر، سپس 1H، 15M، 5M/کاری) را جدا مشخص کن؛ ADX را فقط برای قدرت روند بخوان، نه جهت.
+2. **Market Structure**: HH/HL یا LH/LL و آخرین BOS/CHoCH از marketStructure؛ آیا شکست تأییدشده است یا احتمال Fake Breakout.
+3. **Key Levels**: فقط سطوح مهم resistances/supports با قیمت و قدرت (strength)، و هم‌پوشانی‌شان با fibonacci.levels یا vwap/emaها.
+4. **Chart Pattern (کانال/مثلث)**: طبق بخش بالا.
+5. **Price Action (کندلی)**: پترن‌های patterns را در بستر ساختار بازار توضیح بده، نه فقط اسم‌شان؛ یک کندل تنها بدون هم‌راستایی با ساختار = ضعیف.
+6. **Indicators**: RSI (و rsiDivergence)، MACD، EMA20/50/200، VWAP، Bollinger، Stochastic، ADX — فقط تأیید هستند، هرگز به‌تنهایی سیگنال نمی‌سازند (RSI زیر ۳۰ خودکار BUY نیست، بالای ۷۰ خودکار SELL نیست).
+7. **Liquidity/Smart Money**: از orderBlock، fairValueGaps، liquidity — فقط با داده موجود.
+8. **Confluence Score**: از componentScores و totalConfluenceScore/confidencePercent استفاده کن؛ اگر پایین است (یا ruleBasedVerdict نامشخص/HOLD)، صراحتاً کیفیت را پایین اعلام کن.
+9. **State**: وضعیت فعلی راه‌اندازی را یکی از این‌ها اعلام کن: NO SETUP / APPROACHING LEVEL / LEVEL TOUCHED / TRIGGER FORMED / ENTRY VALID / INVALIDATED. فقط TRIGGER FORMED به بالا مجاز است به سناریوی ورود اشاره کند؛ صرف لمس یک سطح یا خط کانال/مثلث هرگز ENTRY نیست.
+10. **Trading Scenarios**: حداقل دو سناریوی شرطی (LONG/SHORT) با Entry Zone، Trigger، Invalidation/Stop، TP1، TP2، R:R — این اعداد را فقط از suggestedRiskManagement و سطوح واقعی S/R/Fibonacci/کانال بردار، هرگز عدد جدید نساز. اگر قیمت از ناحیهٔ ورود ایدئال دور افتاده، صراحتاً بنویس «دیر شده — منتظر پولبک بمان»، هرگز ورود دیرهنگام را توصیه نکن.
+11. **Final Decision**: دقیقاً یکی: 🟢 ENTER LONG / 🔴 ENTER SHORT / 🟡 WAIT FOR LONG / 🟠 WAIT FOR SHORT / ⚪ NO TRADE.
+12. **One-line Action**: یک جملهٔ عملیاتی صریح برای همین لحظه.
 
-لحن: حرفه‌ای، دقیق، بدون اغراق یا شعار تبلیغاتی.
+## قوانین سخت (هرگز نقض نشوند)
+- هرگز نگو «۱۰۰٪ مطمئن»، «تضمینی» یا «بدون ریسک».
+- هرگز oversold را مساوی صعودی، overbought را مساوی نزولی، ADX بالا را مساوی جهت صعودی نگیر.
+- هرگز لمس یک سطح/خط روند/کانال را مساوی شکست یا برگشت تأییدشده نگیر.
+- هرگز قیمتی را که خیلی از ناحیهٔ ورود دور شده چیس نکن.
+- اگر شواهد متناقض بود (مثلاً تایم‌فریم پایین برخلاف تایم‌فریم بالا)، آن را «Counter-trend» برچسب بزن و اعتماد را کاهش بده، پنهانش نکن.
+- در پایان یادآوری کوتاه کن که این تحلیل آموزشی است و توصیهٔ مالی قطعی نیست.
+
+لحن: حرفه‌ای، دقیق، بدون اغراق یا شعار تبلیغاتی. فقط از داده‌های dataSummary زیر استفاده کن.
 
 DATA:
 ${JSON.stringify(dataSummary)}`;

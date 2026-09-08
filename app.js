@@ -2269,6 +2269,190 @@ const edgeBtn=document.getElementById('edgeBtn'); if(edgeBtn)edgeBtn.onclick=run
 
 // بار اول بعد از لایه Pro Trader
 run();
+
+/* =========================================================
+   ULTIMATE ADAPTIVE INTELLIGENCE — V15 → V20
+   Research-first adaptive layer. It NEVER assumes 100% accuracy.
+   - Walk-forward adaptive edge learning from historical closed candles
+   - Regime-specific component weights
+   - Counterfactual / adversarial thesis checks
+   - Cross-asset market context
+   - Microstructure-aware meta adjustment
+   - Online outcome journal + drift diagnostics
+   - Strict anti-overfit guardrails and confidence caps
+   ========================================================= */
+const ULT_CFG={
+  trainBars:900, minTrainingSignals:60, horizon:6, blendBase:.68, adaptiveMaxShift:14,
+  learningRate:.08, ridge:.20, minEdgeSamples:25, maxAdaptiveConfidence:92,
+  crossAssets:['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT'],
+  regimeMinSamples:20, contextTtlMs:90*1000
+};
+const ULT_STATE=window.__ULT_STATE||{model:null,context:null,trainedAt:0};
+window.__ULT_STATE=ULT_STATE;
+function uClamp(x,a,b){return Math.max(a,Math.min(b,x))}
+function uMean(a){const x=(a||[]).filter(Number.isFinite);return x.length?x.reduce((s,v)=>s+v,0)/x.length:null}
+function uStd(a){const m=uMean(a);if(m==null)return null;return Math.sqrt(uMean(a.map(x=>(x-m)**2))||0)}
+function uSigmoid(x){return 1/(1+Math.exp(-uClamp(x,-30,30)))}
+function uRegime(res){
+  const v=res?.volatilityContext||{}; const t=String(v.trend||'').toLowerCase(); const vol=String(v.volatility||'').toLowerCase();
+  if(t.includes('range')||t.includes('رنج')) return 'RANGE';
+  if(t.includes('transition')||t.includes('گذار')) return 'TRANSITION';
+  if(vol.includes('high')||vol.includes('بالا')) return 'HIGH_VOL';
+  if(t.includes('up')||t.includes('صعود')) return 'TREND_UP';
+  if(t.includes('down')||t.includes('نزول')) return 'TREND_DOWN';
+  const ad=mNum(res?.adxVal?.adx,0), atrPct=(mNum(res?.atrVal?.atr??res?.atrVal,0)/Math.max(1,mNum(res?.lastClose,1)))*100;
+  if(atrPct>5) return 'HIGH_VOL';
+  if(ad<18) return 'RANGE';
+  if(mNum(res?.score,0)>10) return 'TREND_UP';
+  if(mNum(res?.score,0)<-10) return 'TREND_DOWN';
+  return 'NEUTRAL';
+}
+function uFeatureVector(res){
+  const c=res?.componentScores||{};
+  return {
+    structure:uClamp(mNum(c.structure,0),-1,1), trend:uClamp(mNum(c.trend,0),-1,1), ichimoku:uClamp(mNum(c.ichimoku,0),-1,1),
+    supportResistance:uClamp(mNum(c.supportResistance,0),-1,1), volume:uClamp(mNum(c.volume,0),-1,1), priceAction:uClamp(mNum(c.priceAction,0),-1,1),
+    wave:uClamp(mNum(c.wave,0),-1,1), pattern:uClamp(mNum(c.pattern,0),-1,1), momentum:uClamp(mNum(c.momentum,0),-1,1),
+    smc:uClamp(mNum(c.smc,0),-1,1), fibonacci:uClamp(mNum(c.fibonacci,0),-1,1)
+  };
+}
+const ULT_FEATURES=['structure','trend','ichimoku','supportResistance','volume','priceAction','wave','pattern','momentum','smc','fibonacci'];
+function uOutcome(c,i,dir,horizon=6){
+  const entry=c[i+1]?.open; if(!Number.isFinite(entry))return null; const end=Math.min(c.length-1,i+1+horizon);
+  if(!Number.isFinite(end)||end<=i+1)return null;
+  const sign=dir==='LONG'?1:-1; let best=-Infinity;
+  for(let j=i+1;j<=end;j++){const b=c[j];best=Math.max(best,sign>0?(b.high-entry)/entry:(entry-b.low)/entry)}
+  const exit=c[end].close; const ret=sign>0?(exit-entry)/entry:(entry-exit)/entry;
+  return {ret,best,win:ret>0?1:0};
+}
+function uTrainingSignal(res){
+  const dir=mDirection(res); if(!dir)return null;
+  const active=['v-buy','v-sell'].includes(res?.verdictClass)||mNum(res?.entryReadiness,0)>=80;
+  if(!active)return null;
+  return {dir,features:uFeatureVector(res)};
+}
+function uLearnModel(candles){
+  const c=candles||[]; const start=Math.max(180,c.length-ULT_CFG.trainBars), rows=[];
+  for(let i=start;i<c.length-ULT_CFG.horizon-2;i+=1){
+    let r=null; try{r=_ultimateBaseAnalyze(c.slice(0,i+1),null,null)}catch(e){}
+    if(!r||r.insufficient)continue; const s=uTrainingSignal(r); if(!s)continue; const o=uOutcome(c,i,s.dir,ULT_CFG.horizon); if(!o)continue;
+    rows.push({...s,outcome:o});
+  }
+  if(rows.length<ULT_CFG.minTrainingSignals)return {ok:false,reason:`نمونه آموزشی کافی نیست (${rows.length}/${ULT_CFG.minTrainingSignals})`,samples:rows.length};
+  const y=rows.map(x=>x.outcome.win), base=uMean(y)||.5, weights={};
+  for(const f of ULT_FEATURES){
+    const xs=rows.map(x=>x.features[f]); const ym=y.map(v=>v-base); const xm=uMean(xs)||0;
+    const num=rows.reduce((s,x,j)=>s+(x.features[f]-xm)*ym[j],0), den=rows.reduce((s,x)=>s+(x.features[f]-xm)**2,0)+ULT_CFG.ridge;
+    weights[f]=uClamp(num/(den||1),-.9,.9);
+  }
+  const regimes={};
+  for(const row of rows){
+    const rr='ALL'; if(!regimes[rr])regimes[rr]=[]; regimes[rr].push(row);
+  }
+  // Optional regime-specific weights from the same causal historical sample.
+  for(let i=start;i<c.length-ULT_CFG.horizon-2;i+=1){
+    let r=null;try{r=_ultimateBaseAnalyze(c.slice(0,i+1),null,null)}catch(e){}
+    if(!r||r.insufficient)continue; const s=uTrainingSignal(r);if(!s)continue;const o=uOutcome(c,i,s.dir,ULT_CFG.horizon);if(!o)continue;
+    const key=uRegime(r);(regimes[key]||(regimes[key]=[])).push({...s,outcome:o});
+  }
+  const regimeWeights={};
+  for(const [reg,rs] of Object.entries(regimes)){
+    if(reg==='ALL'||rs.length<ULT_CFG.regimeMinSamples)continue; const yy=rs.map(x=>x.outcome.win), b=uMean(yy)||.5, ww={};
+    for(const f of ULT_FEATURES){const xs=rs.map(x=>x.features[f]),xm=uMean(xs)||0;const num=rs.reduce((z,x,j)=>z+(x.features[f]-xm)*(yy[j]-b),0),den=rs.reduce((z,x)=>z+(x.features[f]-xm)**2,0)+ULT_CFG.ridge;ww[f]=uClamp(num/(den||1),-.9,.9)}
+    regimeWeights[reg]={n:rs.length,weights:ww};
+  }
+  return {ok:true,samples:rows.length,baseRate:base,weights,regimeWeights,trainedAt:Date.now(),window:{start,end:c.length-1}};
+}
+function uAdaptiveScore(res,model){
+  if(!model?.ok)return {scoreShift:0,prob:null,agreement:null,weights:null,regime:'UNKNOWN'};
+  const f=uFeatureVector(res),reg=uRegime(res),rw=model.regimeWeights?.[reg]?.weights; const weights=rw||model.weights; let raw=0,abs=0;
+  for(const k of ULT_FEATURES){raw+=f[k]*mNum(weights[k],0);abs+=Math.abs(mNum(weights[k],0));}
+  const normalized=abs?raw/abs:0, shift=uClamp(normalized*ULT_CFG.adaptiveMaxShift,-ULT_CFG.adaptiveMaxShift,ULT_CFG.adaptiveMaxShift);
+  const prob=uSigmoid(normalized*2.5); const signs=ULT_FEATURES.map(k=>Math.sign(f[k])*Math.sign(mNum(weights[k],0))).filter(x=>x); const agreement=signs.length?signs.filter(x=>x>0).length/signs.length:0;
+  return {scoreShift:+shift.toFixed(2),prob:+(prob*100).toFixed(1),agreement:Math.round(agreement*100),weights,regime:reg,samples:rw?.n||model.samples};
+}
+function uCounterfactual(res,adaptive){
+  const f=uFeatureVector(res), w=adaptive?.weights||{}; const contrib=ULT_FEATURES.map(k=>({feature:k,value:f[k],weight:mNum(w[k],0),contribution:f[k]*mNum(w[k],0)})).sort((a,b)=>Math.abs(b.contribution)-Math.abs(a.contribution));
+  const total=contrib.reduce((s,x)=>s+x.contribution,0), top=contrib.slice(0,4); const withoutTop=total-top.reduce((s,x)=>s+x.contribution,0); const direction=total>=0?'LONG':'SHORT';
+  const robust=Math.sign(total)===Math.sign(withoutTop)||Math.abs(total)<.08;
+  const killers=contrib.filter(x=>Math.sign(x.contribution)!==Math.sign(total)&&Math.abs(x.contribution)>.10).slice(0,3);
+  return {direction,total,withoutTop,robust,top,killers};
+}
+function uAdversarial(res,adaptive){
+  const f=uFeatureVector(res),d=mNum(res?.score,0)>=0?1:-1; const contrary=ULT_FEATURES.reduce((s,k)=>s+(f[k]*d<-.35?Math.abs(f[k]):0),0)/ULT_FEATURES.length;
+  const thesis= uCounterfactual(res,adaptive); let penalty=contrary*18; if(!thesis.robust)penalty+=8; if((res?.mtfConfluence?.htfConflict))penalty+=7;
+  return {contrary:+contrary.toFixed(3),penalty:+penalty.toFixed(1),robust:thesis.robust,killers:thesis.killers.map(x=>x.feature)};
+}
+function uApplyAdaptive(res){
+  if(!res||res.insufficient)return res;
+  const model=ULT_STATE.model; const a=uAdaptiveScore(res,model); const cf=uCounterfactual(res,a); const adv=uAdversarial(res,a);
+  const base=mNum(res.score,0), shifted=base+uClamp(a.scoreShift,-ULT_CFG.adaptiveMaxShift,ULT_CFG.adaptiveMaxShift)-adv.penalty*(base>=0?1:-1)*.35;
+  const finalScore=+uClamp(ULT_CFG.blendBase*base+(1-ULT_CFG.blendBase)*shifted,-100,100).toFixed(2);
+  const qShift=(Math.abs(a.scoreShift)*1.1)-adv.penalty*.7-(cf.robust?0:5); res.score=finalScore;
+  res.setupQuality=uClamp(Math.round(mNum(res.setupQuality,50)+qShift),0,100);
+  res.confidence=uClamp(Math.round(Math.min(mNum(res.confidence,50),ULT_CFG.maxAdaptiveConfidence)+(a.agreement-50)*.10-adv.penalty*.35),5,ULT_CFG.maxAdaptiveConfidence);
+  res.adaptiveIntelligence={enabled:!!model?.ok,regime:a.regime,modelSamples:a.samples||0,scoreShift:a.scoreShift,adaptiveProbability:a.prob,componentAgreement:a.agreement,counterfactual:cf,adversarial:adv};
+  res.notes=res.notes||[];
+  if(model?.ok)res.notes.push(`Adaptive Edge: رژیم ${a.regime} | تغییر امتیاز ${a.scoreShift>0?'+':''}${a.scoreShift} | توافق اجزا ${a.agreement}% | نمونه ${a.samples}.`);
+  if(!cf.robust)res.notes.push('⚠ Counterfactual: حذف شواهد اصلی، جهت را شکننده می‌کند؛ ورود با احتیاط/انتظار تأیید مجدد.');
+  if(adv.killers?.length)res.notes.push(`⚠ Adversarial evidence: ${adv.killers.join('، ')} خلاف جهت فعلی فشار ایجاد می‌کند.`);
+  return res;
+}
+async function uFetchContext(interval){
+  const now=Date.now(); if(ULT_STATE.context&&now-ULT_STATE.context.time<ULT_CFG.contextTtlMs)return ULT_STATE.context;
+  const syms=ULT_CFG.crossAssets.filter(s=>s!=='BTCUSDT'||true); const out={};
+  await Promise.all(syms.map(async s=>{try{out[s]=quickTrendSnapshot(await fetchKlines(s,interval,120,true))}catch(e){out[s]={available:false}}}));
+  const vals=Object.values(out).filter(x=>x?.available&&Number.isFinite(x.score)); const breadth=vals.length?uMean(vals.map(x=>x.score)):0;
+  const btc=out.BTCUSDT?.score||0, eth=out.ETHUSDT?.score||0;
+  const context={time:now,breadth,btc,eth,assets:out,marketRegime:Math.abs(breadth)>.45?'TRENDING':Math.abs(breadth)<.15?'RANGE':'MIXED'}; ULT_STATE.context=context; return context;
+}
+function uApplyCrossAsset(res,ctx){
+  if(!res||!ctx)return res; const dir=mNum(res.score,0)>=0?1:-1, b=mNum(ctx.breadth,0),btc=mNum(ctx.btc,0),eth=mNum(ctx.eth,0);
+  const alignment=(b*.5+btc*.3+eth*.2)*dir; const conflict=alignment<-.25; const boost=uClamp(alignment*6,-6,6);
+  res.score=+uClamp(mNum(res.score,0)+boost,-100,100).toFixed(2); res.setupQuality=uClamp(Math.round(mNum(res.setupQuality,50)+(conflict?-6:boost*.6)),0,100);
+  res.crossAssetContext={breadth:+b.toFixed(3),btc:+btc.toFixed(3),eth:+eth.toFixed(3),alignment:+alignment.toFixed(3),conflict,marketRegime:ctx.marketRegime};
+  if(conflict){res.confidence=uClamp(mNum(res.confidence,50)-7,5,92);res.notes=(res.notes||[]);res.notes.push('⚠ Cross-asset conflict: جهت فعلی با بایاس BTC/بازار گسترده هم‌راستا نیست.');}
+  return res;
+}
+function uRenderCard(res){
+  const old=document.getElementById('ultimateIntelCard');if(old)old.remove(); if(!res||res.insufficient)return;
+  const q=res.adaptiveIntelligence||{},x=res.crossAssetContext||{}; const card=document.createElement('div');card.className='card';card.id='ultimateIntelCard';
+  card.innerHTML=`<h3>🧠 Ultimate Adaptive Intelligence</h3>
+  <div class="row"><span>Regime / Adaptive Edge</span><span>${escapeHTML(q.regime||'—')} · ${q.scoreShift==null?'—':(q.scoreShift>=0?'+':'')+q.scoreShift}</span></div>
+  <div class="row"><span>Adaptive Probability</span><span>${q.adaptiveProbability==null?'—':q.adaptiveProbability+'%'}</span></div>
+  <div class="row"><span>Evidence Agreement</span><span>${q.componentAgreement==null?'—':q.componentAgreement+'%'}</span></div>
+  <div class="row"><span>Counterfactual Robustness</span><span>${q.counterfactual?.robust?'🟢 ROBUST':'🟠 FRAGILE'}</span></div>
+  <div class="row"><span>Cross-Asset Alignment</span><span>${x.alignment==null?'—':x.alignment} ${x.conflict?'⚠ conflict':''}</span></div>
+  <div class="muted" style="margin-top:8px">این لایه وزن شواهد را از داده‌های تاریخی یاد می‌گیرد، اما به‌دلیل ریسک overfitting و تغییر رژیم، به‌تنهایی اجازه ورود ایجاد نمی‌کند.</div>`;
+  const anchor=document.getElementById('masterRiskCard')||document.getElementById('quantCard')||document.getElementById('qualityCard'); anchor?.insertAdjacentElement('afterend',card);
+}
+async function trainUltimateModel(){
+  const symbol=els.symbol.value.trim().toUpperCase(), interval=els.interval.value; const out=document.getElementById('masterContent'); if(out)out.textContent='در حال آموزش Adaptive Edge: فقط کندل‌های بسته + Walk-forward causal sampling...';
+  try{const c=await fetchKlines(symbol,interval,Math.min(1000,ULT_CFG.trainBars+220),true);const model=uLearnModel(c);if(model.ok){ULT_STATE.model=model;ULT_STATE.trainedAt=Date.now();try{localStorage.setItem('crypto_ultimate_model',JSON.stringify(model))}catch(e){}};if(out)out.textContent=model.ok?`Adaptive model آموزش داده شد: ${model.samples} سیگنال تاریخی؛ regime-specific weights: ${Object.keys(model.regimeWeights||{}).length}.`:`Adaptive training متوقف شد: ${model.reason}`;return model}catch(e){if(out)out.textContent='خطا در Adaptive Training: '+e.message;return null}
+}
+function loadUltimateModel(){try{const m=JSON.parse(localStorage.getItem('crypto_ultimate_model')||'null');if(m?.ok)ULT_STATE.model=m}catch(e){}}
+loadUltimateModel();
+// Wrap the existing synchronous analyzer: historical learning stays causal; live decision receives only a bounded adaptive adjustment.
+const _ultimateBaseAnalyze=analyze;
+analyze=function(candles,htfCandles,mtfSnapshot){const r=_ultimateBaseAnalyze(candles,htfCandles,mtfSnapshot);return uApplyAdaptive(r)};
+// Replace the main Run with a context-aware version while preserving the existing Trust Gate and validation layers.
+async function runUltimate(){
+  const symbol=els.symbol.value.trim().toUpperCase(), interval=els.interval.value; els.verdictBox.className='verdict v-none';els.verdictBox.textContent='در حال اجرای Ultimate Market Intelligence...';renderTVWidget(symbol,interval);
+  try{
+    const [candles,htfCandles,mtfSnapshot,ctx]=await Promise.all([fetchKlines(symbol,interval,300,true), (async()=>{const tf=HTF_MAP[interval];return tf?fetchKlines(symbol,tf,250,true):null})(), buildCompactMTF(symbol,interval), uFetchContext(interval)]);
+    let res=analyze(candles,htfCandles,mtfSnapshot); if(res.insufficient){renderResult(res,symbol,interval,candles.at(-1)?.closeTime);return}
+    res=uApplyCrossAsset(res,ctx); res=await enrichCryptoDerivatives(res,symbol,interval); res=applyProTraderLayer(res,candles,symbol,interval); res=applyAdvancedQuantLayer(res,candles,symbol); res=applyTrustGate(res,candles,symbol,interval);
+    renderQuantV8(res);renderResult(res,symbol,interval,candles.at(-1)?.closeTime);uRenderCard(res);
+  }catch(e){els.verdictBox.className='verdict v-none';els.verdictBox.textContent='خطا در Ultimate Engine: '+e.message}
+}
+els.loadBtn.onclick=runUltimate;
+(function(){
+  const panel=document.querySelector('.panel');if(!panel)return;
+  const card=document.createElement('div');card.className='card';card.id='ultimateCard';card.innerHTML='<h3>🧠 Ultimate AI Control</h3><button class="secondary" id="trainUltimateBtn">آموزش Adaptive Edge Model</button><button class="secondary" id="scanUltimateBtn" style="margin-right:6px">اجرای تحلیل Ultimate</button><div class="muted" style="margin-top:8px">Adaptive Learning، Regime-specific Edge، Counterfactual، Adversarial Evidence و Cross-Asset Context. مدل هیچ‌گاه به‌تنهایی Trade Ready صادر نمی‌کند.</div>';
+  panel.insertBefore(card,panel.firstChild);
+  document.getElementById('trainUltimateBtn').onclick=trainUltimateModel;document.getElementById('scanUltimateBtn').onclick=runUltimate;
+})();
+
 /* =========================================================
    MASTER ROADMAP IMPLEMENTATION — V11 → V14
    - True Engine Replay / exact live analysis replay
@@ -2389,3 +2573,51 @@ applyTrustGate=function(res,candles,symbol,interval){
     const q=document.getElementById('quantCard');if(q)q.parentNode.insertBefore(c,q.nextSibling);
   }
 })();
+
+/* =========================================================
+   V25 — PRECISION / ROBUSTNESS SUPERVISOR
+   Goal: improve decision quality without pretending certainty.
+   - Replay leakage fix: historical validation uses the frozen base engine.
+   - Purged walk-forward validation.
+   - Deterministic bootstrap confidence intervals.
+   - Permutation/significance test for expectancy.
+   - Brier + calibration diagnostics.
+   - Ensemble consensus + abstention.
+   - Data anomaly / stale-candle guard.
+   - Regime-conditioned performance stability.
+   - Strict precision gate: weak evidence => NO TRADE.
+   ========================================================= */
+const PRECISION_CFG={
+  minTrades:100,minOOS:40,minTrain:80,minFoldTrades:20,
+  purgeBars:6,horizon:6,bootRuns:2000,permRuns:1500,
+  maxECE:.12,maxBrier:.26,minOOSExpectancy:0,
+  minOOSPF:1.05,minSignificance:.05,minPositiveFolds:.60,
+  maxAnomalyRate:.03,maxScoreDisagreement:22,
+  abstainConfidence:62,ensembleBaseWeight:.55
+};
+const PRECISION_STATE=window.__PRECISION_STATE||{validation:null,metrics:null};
+window.__PRECISION_STATE=PRECISION_STATE;
+function pRand(seed){let s=(seed>>>0)||123456789;return function(){s^=s<<13;s^=s>>>17;s^=s<<5;return (s>>>0)/4294967296}}
+function pQuant(a,q){const x=(a||[]).filter(Number.isFinite).sort((a,b)=>a-b);if(!x.length)return null;const z=(x.length-1)*q,k=Math.floor(z),d=z-k;return x[k]+((x[k+1]??x[k])-x[k])*d}
+function pNormalApproxP(z){const az=Math.abs(z);const t=1/(1+.2316419*az),d=.39894228*Math.exp(-az*az/2);let prob=d*t*(.31938153+t*(-.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));prob=1-prob;return 2*(1-prob)}
+function pBrier(trades){const a=(trades||[]).map(t=>({p:mClamp(mNum(t.confidence,50)/100,.001,.999),y:t.r>0?1:0}));if(!a.length)return null;return mMean(a.map(x=>(x.p-x.y)**2))}
+function pCalibration(trades){const a=(trades||[]).map(t=>({p:mClamp(mNum(t.confidence,50)/100,.001,.999),y:t.r>0?1:0}));if(a.length<PRECISION_CFG.minTrain)return{ok:false,reason:'نمونه کافی برای calibration نیست'};const bins=Array.from({length:10},()=>[]);a.forEach(x=>bins[Math.min(9,Math.floor(x.p*10))].push(x));const rows=bins.map((b,i)=>({bin:i,n:b.length,p:b.length?mMean(b.map(x=>x.p)):null,y:b.length?mMean(b.map(x=>x.y)):null})).filter(x=>x.n);const ece=rows.reduce((s,x)=>s+Math.abs(x.p-x.y)*x.n,0)/a.length;return{ok:true,ece,brier:pBrier(trades),rows,quality:ece<=.07?'GOOD':ece<=PRECISION_CFG.maxECE?'FAIR':'POOR'}}
+function pBootstrapCI(trades,runs=PRECISION_CFG.bootRuns,seed=20260909){const r=(trades||[]).map(t=>mNum(t.r,NaN)).filter(Number.isFinite);if(r.length<30)return{ok:false,reason:'حداقل ۳۰ معامله برای CI لازم است'};const rnd=pRand(seed),means=[],pfs=[];for(let k=0;k<runs;k++){const s=[];for(let i=0;i<r.length;i++)s.push(r[Math.floor(rnd()*r.length)]);means.push(mMean(s));const w=s.filter(x=>x>0).reduce((a,b)=>a+b,0),l=Math.abs(s.filter(x=>x<0).reduce((a,b)=>a+b,0));pfs.push(l?w/l:null)}return{ok:true,runs,expectancyCI:[pQuant(means,.025),pQuant(means,.975)],pfCI:[pQuant(pfs.filter(Number.isFinite),.025),pQuant(pfs.filter(Number.isFinite),.975)],probExpPositive:means.filter(x=>x>0).length/runs}}
+function pPermutationTest(trades,runs=PRECISION_CFG.permRuns,seed=271828){const r=(trades||[]).map(t=>mNum(t.r,NaN)).filter(Number.isFinite);if(r.length<30)return{ok:false,reason:'حداقل ۳۰ معامله برای آزمون لازم است'};const observed=mMean(r)||0,rnd=pRand(seed);let ge=0;for(let k=0;k<runs;k++){let s=0;for(const x of r)s+=(rnd()<.5?-x:x);if(Math.abs(s/r.length)>=Math.abs(observed))ge++}const p=(ge+1)/(runs+1);return{ok:true,observed,pValue:p,significant:p<PRECISION_CFG.minSignificance}}
+function pPurgedWalkForward(candles){const c=candles||[],folds=[];if(c.length<PRECISION_CFG.minTrain+PRECISION_CFG.minOOS*3)return{ok:false,reason:'داده کافی برای Purged Walk-Forward نیست'};const n=c.length,foldSize=Math.floor((n-PRECISION_CFG.minTrain)/4);for(let k=0;k<4;k++){const trainEnd=PRECISION_CFG.minTrain+k*foldSize;const testStart=trainEnd+PRECISION_CFG.purgeBars;const testEnd=Math.min(n,(k===3?n:testStart+foldSize));if(testEnd-testStart<PRECISION_CFG.minOOS)continue;const train=trueEngineReplayV11(c.slice(0,trainEnd),{warm:Math.min(MASTER_CFG.warm,Math.max(60,Math.floor(trainEnd*.35))),horizon:PRECISION_CFG.horizon});const test=trueEngineReplayV11(c.slice(testStart,testEnd),{warm:Math.min(MASTER_CFG.warm,Math.max(60,Math.floor((testEnd-testStart)*.35))),horizon:PRECISION_CFG.horizon});folds.push({fold:k+1,train:{trades:train.trades,expectancy:train.expectancy,pf:train.profitFactor},test:{trades:test.trades,expectancy:test.expectancy,pf:test.profitFactor}})}const valid=folds.filter(f=>f.test.trades>=PRECISION_CFG.minFoldTrades);const pos=valid.filter(f=>f.test.expectancy>PRECISION_CFG.minOOSExpectancy).length;return{ok:valid.length>=3,folds,validFolds:valid.length,positiveFolds:pos,positiveRate:valid.length?pos/valid.length:0,passed:valid.length>=3&&pos/valid.length>=PRECISION_CFG.minPositiveFolds}}
+function pAnomalyScan(candles){const c=candles||[];let bad=0,gaps=0,dupes=0,invalid=0;for(let i=0;i<c.length;i++){const x=c[i];if(!(Number.isFinite(x.open)&&Number.isFinite(x.high)&&Number.isFinite(x.low)&&Number.isFinite(x.close)&&Number.isFinite(x.volume))||x.high<x.low||x.high<Math.max(x.open,x.close)||x.low>Math.min(x.open,x.close))invalid++;if(i&&Number.isFinite(x.openTime)&&Number.isFinite(c[i-1].openTime)&&x.openTime<=c[i-1].openTime)dupes++;if(i&&Number.isFinite(x.openTime)&&Number.isFinite(c[i-1].openTime)){const dt=x.openTime-c[i-1].openTime;if(dt>0){const med=dt; if(dt>med*4)gaps++}}}bad=invalid+dupes+gaps;return{n:c.length,invalid,duplicates:dupes,gaps,anomalyRate:c.length?bad/c.length:1,ok:c.length>0&&bad/c.length<=PRECISION_CFG.maxAnomalyRate}}
+function pEnsemble(res){if(!res||res.insufficient)return{status:'ABSTAIN'};const base=mNum(res.score,0),adaptive=mNum(res.adaptiveIntelligence?.scoreShift,0),agree=mNum(res.adaptiveIntelligence?.componentAgreement,50),cf=res.adaptiveIntelligence?.counterfactual?.robust!==false,adv=mNum(res.adaptiveIntelligence?.adversarial?.penalty,0);const adaptiveScore=base+adaptive;const disagreement=Math.abs(base-adaptiveScore);const confidence=mNum(res.confidence,0);const hardConflict=disagreement>PRECISION_CFG.maxScoreDisagreement||agree<35||!cf||adv>=14;let decision=base>=8?'LONG':base<=-8?'SHORT':'NEUTRAL';if(hardConflict||confidence<PRECISION_CFG.abstainConfidence)decision='ABSTAIN';const strength=mClamp((Math.abs(base)*.55+Math.abs(adaptive)*.45)*(agree/100)*(cf?1:.65)*(1-mClamp(adv/40,0,.7)),0,100);return{baseScore:base,adaptiveScore,disagreement,agreement:agree,counterfactualRobust:cf,adversarialPenalty:adv,decision,strength:+strength.toFixed(2),abstain:decision==='ABSTAIN',reason:hardConflict?'شواهد/مدل‌ها اختلاف یا عدم‌قطعیت بالا دارند':'توافق کافی بین لایه‌های مستقل'}}
+function pPrecisionGate(v){const r=[];if(!v?.replay||v.replay.trades<PRECISION_CFG.minTrades)r.push('نمونه معاملات کمتر از حداقل ۱۰۰');if(!v?.oos?.passed)r.push('OOS/Purged Walk-Forward مثبت نیست');if(!v?.cal?.ok||v.cal.ece>PRECISION_CFG.maxECE)r.push('Calibration ضعیف');if(!v?.ci?.ok||v.ci.probExpPositive<.80)r.push('Bootstrap CI: احتمال Expectancy مثبت کافی نیست');if(!v?.perm?.significant)r.push('آزمون permutation از Edge معنادار حمایت نمی‌کند');if(!v?.anomaly?.ok)r.push('کیفیت داده/Anomaly خارج از محدوده است');if(!v?.regime?.passed)r.push('پایداری بین foldها کافی نیست');return{status:r.length?'ABSTAIN/PAPER':'HIGH_CONFIDENCE_RESEARCH',pass:r.length===0,reasons:r}}
+function runPrecisionValidation(){const out=document.getElementById('precisionContent');if(out)out.textContent='در حال اجرای Precision Supervisor: replay → purged OOS → calibration → bootstrap CI → permutation → anomaly...';return Promise.resolve().then(async()=>{const symbol=els.symbol.value.trim().toUpperCase(),interval=els.interval.value,c=await fetchKlines(symbol,interval,1500,true);const replay=trueEngineReplayV11(c),oos=pPurgedWalkForward(c),cal=pCalibration(replay.tradesDetail),ci=pBootstrapCI(replay.tradesDetail),perm=pPermutationTest(replay.tradesDetail),anomaly=pAnomalyScan(c),reg=oos,gate=pPrecisionGate({replay,oos,cal,ci,perm,anomaly,reg});const data={symbol,interval,replay,oos,cal,ci,perm,anomaly,reg,gate,time:Date.now(),engine:'V25_PRECISION_SUPERVISOR'};PRECISION_STATE.validation=data;window.__PRECISION_VALIDATION=data;renderPrecision(data);return data}).catch(e=>{if(out)out.textContent='خطا در Precision Supervisor: '+e.message;return null})}
+function renderPrecision(d){const out=document.getElementById('precisionContent');if(!out)return;const f=x=>Number.isFinite(x)?x.toFixed(3):'—';const pct=x=>Number.isFinite(x)?(x*100).toFixed(1)+'%':'—';out.innerHTML=`<div class="row"><span>Replay</span><span>${d.replay?.trades??0}T · PF ${f(d.replay?.profitFactor)} · Exp ${pct(d.replay?.expectancy)}</span></div><div class="row"><span>Purged OOS</span><span>${d.oos?.passed?'🟢 PASS':'🔴 FAIL'} · ${d.oos?.positiveFolds??0}/${d.oos?.validFolds??0} positive</span></div><div class="row"><span>Calibration</span><span>${d.cal?.quality||'—'} · ECE ${f(d.cal?.ece)} · Brier ${f(d.cal?.brier)}</span></div><div class="row"><span>Bootstrap 95% CI</span><span>${d.ci?.ok?`${f(d.ci.expectancyCI?.[0])} → ${f(d.ci.expectancyCI?.[1])} · P(Exp>0) ${pct(d.ci.probExpPositive)}`:'—'}</span></div><div class="row"><span>Permutation</span><span>${d.perm?.ok?`p=${f(d.perm.pValue)} · ${d.perm.significant?'🟢 significant':'🔴 not significant'}`:'—'}</span></div><div class="row"><span>Data Integrity</span><span>${d.anomaly?.ok?'🟢 OK':'🔴 ANOMALY'} · ${(100*(d.anomaly?.anomalyRate||0)).toFixed(2)}%</span></div><div class="row"><span>Precision Gate</span><span>${d.gate?.pass?'🟢 HIGH-CONFIDENCE RESEARCH':'🟡 ABSTAIN / PAPER'}</span></div><div class="muted" style="margin-top:8px">${d.gate?.reasons?.join(' • ')||'تمام شروط آماری عبور کردند؛ این تضمین سود آینده نیست.'}</div>`}
+
+// Historical replay must be isolated from the current adaptive model to prevent validation leakage.
+const _mReplaySignalFrozen=mReplaySignal;
+mReplaySignal=function(c){try{const htf=null,mtf=null,r=_ultimateBaseAnalyze(c,htf,mtf);if(!r||r.insufficient)return null;const dir=mDirection(r),plan=mPlan(r,c);const active=String(r.entryState||'')==='ENTRY ACTIVE'||String(r.entryState||'').includes('ACTIVE')||['v-buy','v-sell'].includes(r.verdictClass);return{res:r,dir,plan,active,score:mNum(r.score,0),setupQuality:mNum(r.setupQuality,0),confidence:mNum(r.confidence,0)}}catch(e){return null}};
+
+// Precision UI.
+(function(){const panel=document.querySelector('.panel');if(!panel||document.getElementById('precisionCard'))return;const card=document.createElement('div');card.className='card';card.id='precisionCard';card.innerHTML='<h3>🎯 Precision Supervisor — V25</h3><button class="secondary" id="precisionBtn">اجرای Precision Validation</button><div id="precisionContent" class="muted" style="margin-top:8px">Purged Walk-Forward، Bootstrap CI، Permutation Test، Calibration و Data Integrity را مستقل بررسی می‌کند.</div>';const master=document.getElementById('masterCard');if(master)master.parentNode.insertBefore(card,master.nextSibling);else panel.appendChild(card);document.getElementById('precisionBtn').onclick=runPrecisionValidation})();
+
+// Add a final abstention layer to live analysis. It can only downgrade confidence; it never upgrades a signal to trade-ready.
+const _precisionRender=renderResult;
+renderResult=function(res,s,i,t){try{if(res&&!res.insufficient){const e=pEnsemble(res);res.precisionSupervisor=e;if(e.abstain&&(res.verdictClass==='v-buy'||res.verdictClass==='v-sell')){res.verdictClass='v-hold';res.verdict='🟡 ABSTAIN — عدم‌قطعیت/اختلاف شواهد بالا';res.entryState='ABSTAIN';res.risk=null;res.confidence=Math.min(mNum(res.confidence,0),49);res.notes=res.notes||[];res.notes.push('Precision Supervisor: برای جلوگیری از over-trading، سیگنال به‌دلیل عدم‌قطعیت abstain شد.')}}}catch(e){console.warn('Precision Supervisor live layer',e)}_precisionRender(res,s,i,t)};

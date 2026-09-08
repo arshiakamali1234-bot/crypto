@@ -119,6 +119,7 @@ async function drawAnalysisOnChart(res){
       addHLine(res.risk.stopLoss, '🛑 حد ضرر', '#ef5350', 'solid', 2);
       addHLine(res.risk.takeProfit1, '✅ حد سود ۱', '#26a69a', 'solid', 2);
       addHLine(res.risk.takeProfit2, '✅ حد سود ۲', '#26a69a', 'solid', 1);
+      addHLine(res.risk.takeProfit3, '✅ حد سود ۳', '#26a69a', 'dashed', 1);
     }
 
     // بلاک سفارش (Order Block) در صورت شناسایی
@@ -716,16 +717,35 @@ function analyze(candles, htfCandles){
     const riskAmount = Math.abs(lastClose - stopLoss);
     const takeProfit1 = lastClose + dir*riskAmount*1.5;
     const takeProfit2 = lastClose + dir*riskAmount*2.5;
+    // TP3: تا نزدیک‌ترین سطح ساختاری بعدی (اگر معنادار بود) وگرنe بر مبنای ATR/RR=4
+    const structuralTP3 = dir===1
+      ? resistances.find(r=>r.price > takeProfit2)?.price
+      : supports.find(s=>s.price < takeProfit2)?.price;
+    const takeProfit3 = structuralTP3 ?? (lastClose + dir*riskAmount*4);
+    // --- پیشنهاد لوریج (صرفاً آموزشی؛ بر اساس نوسان ATR% و کیفیت سیگنال، محافظه‌کارانه) ---
+    const atrPct = (atrVal / lastClose) * 100;
+    let suggestedLeverage;
+    if(confidence < 40 || atrPct > 4) suggestedLeverage = '۱x تا ۳x (نوسان بالا/اطمینان پایین — لوریج پایین یا اسپات)';
+    else if(confidence < 65 || atrPct > 2) suggestedLeverage = '۳x تا ۵x (احتیاط، ریسک هر ترید را حداکثر ۱-۲٪ سرمایه نگه دار)';
+    else suggestedLeverage = '۵x تا ۱۰x (حداکثر پیشنهادی؛ حتی در بهترین ستاپ بالاتر از این توصیه نمی‌شود)';
     risk = {
-      entry: lastClose, stopLoss, takeProfit1, takeProfit2,
-      riskRewardTP1: 1.5, riskRewardTP2: 2.5
+      entry: lastClose, stopLoss, takeProfit1, takeProfit2, takeProfit3,
+      riskRewardTP1: 1.5, riskRewardTP2: 2.5,
+      riskRewardTP3: +(Math.abs(takeProfit3-lastClose)/riskAmount).toFixed(2),
+      suggestedLeverage,
+      estimatedFeeNote: 'کارمزد نمونه بایننس (Taker): اسپات ~۰.۱٪ | فیوچرز ~۰.۰۴٪-۰.۰۵٪ در هر پا (ورود+خروج جمعاً دو برابر) — درصد واقعی به سطح تخفیف/VIP حساب شما بستگی دارد و اینجا محاسبه‌شده از داده زنده نیست.'
     };
   }
+
+  // --- نقاط سوئینگ اخیر (برای امکان تشخیص الگوهایی مثل دبل‌تاپ/باتم و سر-و-شانه توسط AI، فقط از داده واقعی) ---
+  const { highs: swingHighsRaw, lows: swingLowsRaw } = findSwingPoints(candles, 3);
+  const recentSwingHighs = swingHighsRaw.slice(-6).map(p=>+p.toFixed(6));
+  const recentSwingLows = swingLowsRaw.slice(-6).map(p=>+p.toFixed(6));
 
   return {
     lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
     fib, vwapVal, structure, orderBlock, fvgs, liquidity,
-    resistances, supports, patterns, chartPattern, notes, score, verdict, verdictClass, confidence, risk,
+    resistances, supports, patterns, chartPattern, recentSwingHighs, recentSwingLows, notes, score, verdict, verdictClass, confidence, risk,
     trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore, liqScore
   };
 }
@@ -772,6 +792,12 @@ function renderResult(res, symbol, interval){
     document.getElementById('r_sl').textContent = res.risk.stopLoss.toFixed(4);
     document.getElementById('r_tp1').textContent = `${res.risk.takeProfit1.toFixed(4)} (R:R ${res.risk.riskRewardTP1})`;
     document.getElementById('r_tp2').textContent = `${res.risk.takeProfit2.toFixed(4)} (R:R ${res.risk.riskRewardTP2})`;
+    const tp3El = document.getElementById('r_tp3');
+    if(tp3El) tp3El.textContent = `${res.risk.takeProfit3.toFixed(4)} (R:R ${res.risk.riskRewardTP3})`;
+    const levEl = document.getElementById('r_leverage');
+    if(levEl) levEl.textContent = res.risk.suggestedLeverage;
+    const feeEl = document.getElementById('r_fee');
+    if(feeEl) feeEl.textContent = res.risk.estimatedFeeNote;
   } else {
     riskCard.style.display='none';
   }
@@ -837,6 +863,8 @@ async function maybeCallAI(res, symbol, interval){
     resistances: res.resistances, supports: res.supports,
     patterns: res.patterns.map(p=>p.name),
     chartPattern: res.chartPattern, // کانال/مثلث/گوه شناسایی‌شده روی سوئینگ‌های اخیر (یا null)
+    recentSwingHighs: res.recentSwingHighs, // آخرین قله‌های سوئینگ واقعی (برای بررسی دبل‌تاپ/سر-و-شانه و... توسط AI)
+    recentSwingLows: res.recentSwingLows,  // آخرین دره‌های سوئینگ واقعی (برای بررسی دبل‌باتم و...)
     volumeNote: res.notes.find(n=>n.includes('حجم')),
     componentScores: {
       trend: res.trendScore, momentum: res.momScore, priceAction: res.paScore,
@@ -885,7 +913,30 @@ async function maybeCallAI(res, symbol, interval){
 11. **Final Decision**: دقیقاً یکی: 🟢 ENTER LONG / 🔴 ENTER SHORT / 🟡 WAIT FOR LONG / 🟠 WAIT FOR SHORT / ⚪ NO TRADE.
 12. **One-line Action**: یک جملهٔ عملیاتی صریح برای همین لحظه.
 
-## قوانین سخت (هرگز نقض نشوند)
+## موتور پیشرفتهٔ الگوهای نموداری کلاسیک (اجباری)
+علاوه بر chartPattern (کانال/مثلث/گوه محاسبه‌شده)، با استفاده از recentSwingHighs و recentSwingLows (که مقادیر واقعی قله/درهٔ سوینگ‌های اخیر هستند، نه تخمین بصری) بررسی کن آیا الگوهای زیر با شواهد ساختاری کافی وجود دارند: دبل‌تاپ/دبل‌باتم، سر-و-شانه/سر-و-شانه معکوس، تریپل‌تاپ/باتم، فلگ/پنانت (نیازمند یک ایمپالس قبلی واضح در marketStructure)، مستطیل/رنج، کاپ-اند-هندل، بادبزنی.
+قوانین سخت این بخش:
+- هرگز الگو را فقط چون «شبیه» است تأیید نکن؛ حداقل شرایط ساختاری (مثلاً دو قله نزدیک به هم با یک نکلاین مشخص برای دبل‌تاپ) باید برقرار باشد.
+- اگر شواهد کافی در recentSwingHighs/recentSwingLows/resistances/supports نبود، صراحتاً بنویس «PATTERN: NONE DETECTED» و ادامه نده.
+- هر الگوی تأییدشده باید وضعیت FORMING / TRIGGERED / CONFIRMED / INVALIDATED بگیرد؛ فقط CONFIRMED (با بسته‌شدن کندل بیرون از نکلاین/الگو) می‌تواند در سناریوی معاملاتی قوی نقش داشته باشد.
+- تارگت الگو را فقط با فرمول کلاسیک اندازه‌گیری‌شده (فاصلهٔ الگو تا نکلاین، تصویر شده در جهت شکست) حساب کن، نه عدد دلخواه؛ اگر نمی‌توانی این فاصله را از داده‌های موجود دقیق حساب کنی، بنویس «تارگت الگو قابل‌محاسبهٔ دقیق نیست، به سطوح S/R واقعی رجوع کن».
+- اگر chartPattern (کانال/مثلث) و یک الگوی کلاسیک دیگر هم‌زمان با هم هم‌راستا بودند، آن را confluence مثبت اعلام کن؛ اگر متناقض بودند، صریحاً تناقض را بگو و اعتماد را کم کن.
+
+## ستاپ ورود نهایی (اجباری — دقیقاً با همین ساختار در انتهای پاسخ بیاور)
+اگر verdict یک سیگنال قاطع (BUY/SELL) بود و suggestedRiskManagement (فیلد risk در داده) مقدار دارد، این جدول را دقیقاً از همان اعداد پر کن (هیچ عدد جدیدی نساز):
+
+**ستاپ معاملاتی پیشنهادی**
+- جهت: LONG یا SHORT
+- نقطهٔ ورود (Entry): از risk.entry
+- کارمزد تخمینی (Entry Fee note): از risk.estimatedFeeNote — فقط به‌عنوان یادآوری، نه عدد قطعی چون به تعرفهٔ حساب کاربر بستگی دارد
+- حد ضرر (Stop Loss): از risk.stopLoss
+- حد سود ۱ (Take Profit 1): از risk.takeProfit1 با R:R آن
+- حد سود ۲ (Take Profit 2): از risk.takeProfit2 با R:R آن
+- حد سود ۳ (Take Profit 3): از risk.takeProfit3 با R:R آن
+- لوریج پیشنهادی: از risk.suggestedLeverage — با یادآوری صریح که این عدد صرفاً آموزشی است، نه توصیهٔ مالی، و لوریج بالا ریسک لیکوییدشدن را به‌شدت افزایش می‌دهد.
+اگر risk وجود نداشت (یعنی سیگنال HOLD/NO TRADE بود)، این بخش را ننویس و به‌جایش بگو چرا شرایط برای تعریف ستاپ ورود کافی نیست.
+
+
 - هرگز نگو «۱۰۰٪ مطمئن»، «تضمینی» یا «بدون ریسک».
 - هرگز oversold را مساوی صعودی، overbought را مساوی نزولی، ADX بالا را مساوی جهت صعودی نگیر.
 - هرگز لمس یک سطح/خط روند/کانال را مساوی شکست یا برگشت تأییدشده نگیر.

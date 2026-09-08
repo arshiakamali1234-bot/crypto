@@ -24,13 +24,35 @@ const els = {
   riskPctInput: document.getElementById('riskPctInput'),
 };
 
+function finiteNumber(v){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function fmt(v, digits=4, fallback='—'){
+  const n = finiteNumber(v);
+  return n===null ? fallback : n.toFixed(digits);
+}
+function escapeHTML(v){
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function validPlan(p){
+  return !!p &&
+    finiteNumber(p.entry)!==null &&
+    finiteNumber(p.stopLoss)!==null &&
+    finiteNumber(p.takeProfit1)!==null &&
+    finiteNumber(p.takeProfit2)!==null &&
+    finiteNumber(p.takeProfit3)!==null &&
+    Math.abs(Number(p.entry)-Number(p.stopLoss))>0;
+}
+
 const INTERVAL_MAP_TV = { '1m':'1','5m':'5','15m':'15','30m':'30','1h':'60','4h':'240','1d':'D','1w':'W' };
 // تایم‌فریم بالاتر برای تأیید چندتایم‌فریمی (Multi-Timeframe Confirmation)
 const HTF_MAP = { '1m':'15m','5m':'1h','15m':'4h','30m':'4h','1h':'4h','4h':'1d','1d':'1w','1w':'1M' };
 
 // ---------- تنظیمات محلی ----------
 function loadSettings(){
-  const s = JSON.parse(localStorage.getItem('ta_settings') || '{}');
+  let s={};
+  try{ s = JSON.parse(localStorage.getItem('ta_settings') || '{}') || {}; }catch(e){ s={}; }
   els.aiProvider.value = s.provider || 'none';
   els.apiKey.value = s.apiKey || '';
 }
@@ -144,7 +166,7 @@ async function fetchKlines(symbol, interval, limit=300, closedOnly=true){
   const fetchLimit = closedOnly ? Math.min(limit+1, 1000) : limit;
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${fetchLimit}`;
   const res = await fetch(url);
-  if(!res.ok) throw new Error('عدم دسترسی به داده بازار برای این نماد/تایم‌فریم');
+  if(!res.ok){ let msg='عدم دسترسی به داده بازار برای این نماد/تایم‌فریم'; try{const er=await res.json(); if(er?.msg) msg += ' — '+er.msg;}catch(_){} throw new Error(msg); }
   const raw = await res.json();
   let mapped = raw.map(k => ({
     time:k[0], closeTime:k[6], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]
@@ -640,36 +662,47 @@ function signDir(v){ return v>0 ? 'up' : v<0 ? 'down' : 'neutral'; }
 
 function ichimoku(candles){
   const n=candles.length;
-  if(n<60) return null;
-  const mid=(arr)=> (Math.max(...arr.map(c=>c.high))+Math.min(...arr.map(c=>c.low)))/2;
-  const tenkan=mid(candles.slice(-9));
-  const kijun=mid(candles.slice(-26));
-  const spanB=mid(candles.slice(-52));
-  const spanA=(tenkan+kijun)/2;
-  const pastKijun = n>=27 ? mid(candles.slice(-27,-1)) : kijun;
-  const prevTenkan = n>=10 ? mid(candles.slice(-10,-1)) : tenkan;
-  const prevKijun = n>=27 ? mid(candles.slice(-27,-1)) : kijun;
-  const cloudTop=Math.max(spanA,spanB), cloudBottom=Math.min(spanA,spanB);
+  if(n<80) return null;
+  const mid=(arr)=>{
+    if(!arr || !arr.length) return null;
+    return (Math.max(...arr.map(c=>c.high))+Math.min(...arr.map(c=>c.low)))/2;
+  };
+  const midAt=(endExclusive,len)=>mid(candles.slice(Math.max(0,endExclusive-len),endExclusive));
+  const tenkan=midAt(n,9), kijun=midAt(n,26), spanB=midAt(n,52), futureSpanA=(tenkan+kijun)/2;
+  const cloudRefEnd=n-26;
+  const refTenkan=cloudRefEnd>=9?midAt(cloudRefEnd,9):tenkan;
+  const refKijun=cloudRefEnd>=26?midAt(cloudRefEnd,26):kijun;
+  const refSpanB=cloudRefEnd>=52?midAt(cloudRefEnd,52):spanB;
+  const currentSpanA=(refTenkan+refKijun)/2;
+  const currentSpanB=refSpanB;
+  const cloudTop=Math.max(currentSpanA,currentSpanB), cloudBottom=Math.min(currentSpanA,currentSpanB);
+  const futureCloudTop=Math.max(futureSpanA,spanB), futureCloudBottom=Math.min(futureSpanA,spanB);
   const close=candles.at(-1).close;
   const atrVal=atr(candles,14)||Math.max(close*0.005,1e-9);
   const cloudThickness=(cloudTop-cloudBottom)/atrVal;
-  const tkCross = tenkan>kijun && prevTenkan<=prevKijun ? 'bullish' : tenkan<kijun && prevTenkan>=prevKijun ? 'bearish' : 'none';
+  const futureThickness=(futureCloudTop-futureCloudBottom)/atrVal;
+  const prevTenkan=midAt(n-1,9), prevKijun=midAt(n-1,26);
+  const tkCross=tenkan>kijun && prevTenkan<=prevKijun ? 'bullish' : tenkan<kijun && prevTenkan>=prevKijun ? 'bearish' : 'none';
   const priceVsCloud=close>cloudTop?'above':close<cloudBottom?'below':'inside';
-  // Chikou is current close compared with price/cloud 26 periods back.
-  const ref=n>=27 ? candles[n-27] : null;
+  const ref=candles[n-27];
   const chikou=close;
   const chikouVsPrice=ref ? (chikou>ref.close?'above':chikou<ref.close?'below':'inside') : 'unknown';
-  const bullishFuture=spanA>spanB;
+  const bullishFuture=futureSpanA>spanB;
   let score=0;
   score += priceVsCloud==='above'?3:priceVsCloud==='below'?-3:0;
   score += tenkan>kijun?2:tenkan<kijun?-2:0;
-  score += kijun>=pastKijun?1:-1;
+  score += kijun>=prevKijun?1:-1;
   score += bullishFuture?2:-2;
-  score += cloudThickness>0.8?1:0;
+  score += futureThickness>0.8?1:0;
   score += chikouVsPrice==='above'?2:chikouVsPrice==='below'?-2:0;
   score += tkCross==='bullish'?1:tkCross==='bearish'?-1:0;
-  return {tenkan,kijun,senkouA:spanA,senkouB:spanB,cloudTop,cloudBottom,cloudThickness,
-    priceVsCloud,bullishFuture,chikou,chikouVsPrice,tkCross,score:clamp(50+score*5)};
+  return {
+    tenkan,kijun,senkouA:futureSpanA,senkouB:spanB,
+    currentSpanA,currentSpanB,cloudTop,cloudBottom,
+    futureCloudTop,futureCloudBottom,cloudThickness,futureCloudThickness:futureThickness,
+    priceVsCloud,bullishFuture,chikou,chikouVsPrice,tkCross,
+    score:clamp(50+score*5)
+  };
 }
 
 function volumeProfileLite(candles,bins=24,lookback=120){
@@ -764,11 +797,17 @@ function wavePressureV2(candles,atrVal,pattern,structure,vol){
   if(pattern?.breakout==='up') bull+=10; if(pattern?.breakout==='down') bear+=10;
   if(vol?.expanding && last){ if(last.dir==='up')bull+=6; else bear+=6; }
   bull=clamp(Math.round(bull)); bear=clamp(Math.round(bear));
+  const pivotTrend = waves.length>=3
+    ? (Math.abs(waves.at(-1).dispPct)>Math.abs(waves.at(-2).dispPct)*1.08
+        ? 'در حال گسترش'
+        : Math.abs(waves.at(-1).dispPct)<Math.abs(waves.at(-2).dispPct)*0.92
+          ? 'در حال انقباض' : 'تقریباً ثابت')
+    : 'داده ناکافی';
   return {waves:waves.slice(-5),bullishPressure:bull,bearishPressure:bear,
     overall:Math.abs(bull-bear)<10?'متعادل (BALANCED PRESSURE)':bull>bear?'فشار صعودی غالب (BULLISH PRESSURE)':'فشار نزولی غالب (BEARISH PRESSURE)',
     upAcceleration:ups.length>=2?(ups.at(-1).eff>ups.at(-2).eff*1.1?'Accelerating':ups.at(-1).eff<ups.at(-2).eff*.9?'Decelerating':'Stable'):'داده ناکافی',
     downAcceleration:downs.length>=2?(downs.at(-1).eff>downs.at(-2).eff*1.1?'Accelerating':downs.at(-1).eff<downs.at(-2).eff*.9?'Decelerating':'Stable'):'داده ناکافی',
-    pivotExpansion:expansion,pullbackWeakening:pullWeak};
+    pivotExpansion:expansion,pullbackWeakening:pullWeak,pivotTrend};
 }
 
 function weightedAnalysisScore(parts){
@@ -778,20 +817,58 @@ function weightedAnalysisScore(parts){
   return {directional:+directional.toFixed(2),quality:clamp(Math.round(50+directional/2),0,100),weights};
 }
 
-function buildProfessionalPlan(dir,entry,atrVal,supports,resistances,quality,triggered=false){
-  if(!entry||!atrVal)return null;
-  const sup=supports?.filter(x=>x.price<entry).sort((a,b)=>b.price-a.price)[0]?.price;
-  const res=resistances?.filter(x=>x.price>entry).sort((a,b)=>a.price-b.price)[0]?.price;
+function buildProfessionalPlan(dir,entry,atrVal,supports=[],resistances=[],quality=0,triggered=false){
+  entry = finiteNumber(entry);
+  atrVal = finiteNumber(atrVal);
+  if(entry===null || atrVal===null || atrVal<=0) return null;
+
+  const belowSupport = (supports||[])
+    .filter(x=>finiteNumber(x?.price)!==null && x.price<entry)
+    .sort((a,b)=>b.price-a.price)[0]?.price;
+  const aboveResistance = (resistances||[])
+    .filter(x=>finiteNumber(x?.price)!==null && x.price>entry)
+    .sort((a,b)=>a.price-b.price)[0]?.price;
+
   const buffer=atrVal*0.20;
-  let stop=dir==='LONG' ? Math.min(entry-atrVal*1.5,sup?sup-buffer:entry-atrVal*1.5) : Math.max(entry+atrVal*1.5,res?res+buffer:entry+atrVal*1.5);
-  if((dir==='LONG'&&stop>=entry)||(dir==='SHORT'&&stop<=entry))return null;
+  let stop;
+  if(dir==='LONG'){
+    stop=Math.min(entry-atrVal*1.5, belowSupport!==undefined ? belowSupport-buffer : entry-atrVal*1.5);
+  }else{
+    stop=Math.max(entry+atrVal*1.5, aboveResistance!==undefined ? aboveResistance+buffer : entry+atrVal*1.5);
+  }
+
+  if(!Number.isFinite(stop) || (dir==='LONG'&&stop>=entry) || (dir==='SHORT'&&stop<=entry)) return null;
+
   const risk=Math.abs(entry-stop);
-  const tp1=entry+(dir==='LONG'?1:-1)*risk*1.5, tp2=entry+(dir==='LONG'?1:-1)*risk*2.5;
-  const structural=dir==='LONG' ? resistances?.find(x=>x.price>tp2)?.price : supports?.slice().reverse().find(x=>x.price<tp2)?.price;
-  const tp3=structural ?? entry+(dir==='LONG'?1:-1)*risk*4;
-  return {direction:dir,active:triggered,entry,stopLoss:stop,takeProfit1:tp1,takeProfit2:tp2,takeProfit3:tp3,
-    riskRewardTP1:1.5,riskRewardTP2:2.5,riskRewardTP3:+(Math.abs(tp3-entry)/risk).toFixed(2),
-    state:triggered?5:3,entryState:triggered?'ENTRY VALID':'TRIGGER FORMED',quality};
+  if(!(risk>0)) return null;
+
+  const sign=dir==='LONG'?1:-1;
+  const tp1=entry+sign*risk*1.5;
+  const tp2=entry+sign*risk*2.5;
+  const structural=dir==='LONG'
+    ? (resistances||[]).filter(x=>finiteNumber(x?.price)!==null && x.price>tp2).sort((a,b)=>a.price-b.price)[0]?.price
+    : (supports||[]).filter(x=>finiteNumber(x?.price)!==null && x.price<tp2).sort((a,b)=>b.price-a.price)[0]?.price;
+  const tp3=finiteNumber(structural) ?? entry+sign*risk*4;
+
+  if(![tp1,tp2,tp3].every(Number.isFinite)) return null;
+
+  const atrPct=(atrVal/entry)*100;
+  let suggestedLeverage;
+  if(quality<40 || atrPct>4) suggestedLeverage='۱x تا ۳x (نوسان بالا/اطمینان پایین — لوریج پایین یا اسپات)';
+  else if(quality<65 || atrPct>2) suggestedLeverage='۳x تا ۵x (احتیاط، ریسک هر ترید را حداکثر ۱-۲٪ سرمایه نگه دار)';
+  else suggestedLeverage='۵x تا ۱۰x (حداکثر آموزشی؛ لوریج بالاتر توصیه نمی‌شود)';
+
+  return {
+    direction:dir, active:!!triggered, entry, stopLoss:stop,
+    takeProfit1:tp1, takeProfit2:tp2, takeProfit3:tp3,
+    riskRewardTP1:1.5, riskRewardTP2:2.5,
+    riskRewardTP3:+(Math.abs(tp3-entry)/risk).toFixed(2),
+    suggestedLeverage,
+    estimatedFeeNote:'کارمزد واقعی حساب به سطح VIP/تخفیف و نوع بازار بستگی دارد؛ قبل از معامله کارمزد فعلی صرافی را بررسی کن.',
+    state:triggered?5:3,
+    entryState:triggered?'ENTRY VALID':'TRIGGER FORMED',
+    quality
+  };
 }
 
 function analyze(candles, htfCandles){
@@ -847,17 +924,19 @@ function analyze(candles, htfCandles){
   else if(setupQuality>=70 && directional>10){verdict='🟡 WAIT FOR LONG — ستاپ خوب است، اما ورود هنوز تأیید کامل ندارد';}
   else if(setupQuality>=70 && directional<-10){verdict='🟠 WAIT FOR SHORT — ستاپ خوب است، اما ورود هنوز تأیید کامل ندارد';}
   else if(setupQuality<60){verdict='⚪ NO TRADE — کیفیت ستاپ زیر حداقل آستانه است';}
-  const planLong=buildProfessionalPlan('LONG',nearSupport||lastClose,atrVal,supports,resistances,setupQuality,longTrigger&&longReadiness>=80);
-  const planShort=buildProfessionalPlan('SHORT',nearResistance||lastClose,atrVal,supports,resistances,setupQuality,shortTrigger&&shortReadiness>=80);
-  const risk=verdictClass==='v-buy'?planLong:verdictClass==='v-sell'?planShort:null;
+  const longEntry = nearSupport ? nearestSup : lastClose;
+   const shortEntry = nearResistance ? nearestRes : lastClose;
+   const planLong=buildProfessionalPlan('LONG',longEntry,atrVal,supports,resistances,setupQuality,longTrigger&&longReadiness>=80);
+  const planShort=buildProfessionalPlan('SHORT',shortEntry,atrVal,supports,resistances,setupQuality,shortTrigger&&shortReadiness>=80);
+  const risk=verdictClass==='v-buy'&&validPlan(planLong)?planLong:verdictClass==='v-sell'&&validPlan(planShort)?planShort:null;
   const watchLong=planLong?{...planLong,active:false,trigger:`بسته‌شدن بالای مقاومت/تریگر با حجم ≥ ۱.۱x میانگین ۲۰ کندل؛ سپس تأیید مجدد ساختار`,state:longTrigger?4:nearSupport?2:1,entryState:longTrigger?'TRIGGER CONFIRMED':nearSupport?'LEVEL TOUCHED':'APPROACHING LEVEL'}:null;
   const watchShort=planShort?{...planShort,active:false,trigger:`بسته‌شدن زیر حمایت/تریگر با حجم ≥ ۱.۱x میانگین ۲۰ کندل؛ سپس تأیید مجدد ساختار`,state:shortTrigger?4:nearResistance?2:1,entryState:shortTrigger?'TRIGGER CONFIRMED':nearResistance?'LEVEL TOUCHED':'APPROACHING LEVEL'}:null;
   const notes=[];
   notes.push(`مدل امتیازدهی وزنی: Market Structure=20، Trend/HTF=15، Ichimoku=12، S/R=10، Volume=10، Price Action=8، Wave=8، Pattern=6، Momentum=5، SMC=4، Fibonacci=2.`);
-  notes.push(`Setup Quality=${setupQuality}/100 | Entry Readiness=${readiness}/100 | امتیاز جهت‌دار=${directional.toFixed(1)}`);
+  notes.push(`Setup Quality=${setupQuality}/100 | Entry Readiness=${readiness}/100 | امتیاز جهت‌دار=${fmt(directional,1)}`);
   notes.push(`ساختار: ${structure.structure}${structure.event?' | '+structure.event:''}`);
   notes.push(`Ichimoku: ${ich?.priceVsCloud||'N/A'} | TK=${ich?.tkCross||'N/A'} | Future Cloud=${ich?.bullishFuture?'Bullish':'Bearish'}`);
-  notes.push(`حجم: ${volume.ratio.toFixed(2)}x میانگین ۲۰ کندل | ADX=${adxVal.adx.toFixed(1)}`);
+  notes.push(`حجم: ${fmt(volume?.ratio,2)}x میانگین ۲۰ کندل | ADX=${fmt(adxVal?.adx,1)}`);
   if(htfConflict)notes.push('⚠ تعارض تایم‌فریم بالاتر با جهت فعلی؛ کیفیت سیگنال کاهش داده شد.');
   if(!longTrigger&&!shortTrigger)notes.push('تریگر بسته‌شدن + حجم هنوز تأیید نشده؛ لمس سطح ورود محسوب نمی‌شود.');
   const confidence=clamp(Math.round(setupQuality*(readiness/100)),5,95);
@@ -976,6 +1055,7 @@ function renderResult(res, symbol, interval, lastClosedTime){
   const riskCard = document.getElementById('riskCard');
   const riskContent = document.getElementById('riskContent');
   function planRows(p){
+    if(!validPlan(p)) return '<p class="muted">⚠ برنامه معاملاتی عددی معتبر نیست؛ ورود/حدضرر/اهداف ناقص است. سیگنال صادر نشد.</p>';
     const capital = Math.max(+els.capitalInput.value || 0, 0);
     const riskPct = Math.min(Math.max(+els.riskPctInput.value || 0, 0), 100);
     const riskAmountUSDT = capital * riskPct / 100;
@@ -985,17 +1065,17 @@ function renderResult(res, symbol, interval, lastClosedTime){
       units: +(riskAmountUSDT / perUnitRisk).toFixed(6),
       positionValueUSDT: +((riskAmountUSDT / perUnitRisk) * p.entry).toFixed(2)
     } : null;
-    p.positionSizing = posSizing; // برای گنجاندن در dataSummary ارسالی به AI
+    p.positionSizing = posSizing;
     return `
-      <div class="row"><span>نقطه ورود (Entry)</span><span>${p.entry.toFixed(4)}</span></div>
-      <div class="row"><span>حد ضرر (Stop Loss)</span><span>${p.stopLoss.toFixed(4)}</span></div>
-      <div class="row"><span>حد سود ۱ (TP1)</span><span>${p.takeProfit1.toFixed(4)} (R:R ${p.riskRewardTP1})</span></div>
-      <div class="row"><span>حد سود ۲ (TP2)</span><span>${p.takeProfit2.toFixed(4)} (R:R ${p.riskRewardTP2})</span></div>
-      <div class="row"><span>حد سود ۳ (TP3)</span><span>${p.takeProfit3.toFixed(4)} (R:R ${p.riskRewardTP3})</span></div>
-      <div class="row"><span>لوریج پیشنهادی (آموزشی)</span><span>${p.suggestedLeverage}</span></div>
-      ${posSizing ? `<div class="row"><span>سایز پوزیشن (بر اساس سرمایه/ریسک واردشده)</span><span>${posSizing.units} واحد (${posSizing.positionValueUSDT} USDT)</span></div>
-      <p class="muted">با سرمایهٔ ${capital} USDT و ریسک ${riskPct}٪، حداکثر ضرر مجاز این ترید ${posSizing.riskAmountUSDT} USDT است.</p>` : '<p class="muted">برای محاسبهٔ سایز پوزیشن، سرمایه و درصد ریسک را از هدر بالا وارد کن.</p>'}
-      <p class="muted" style="margin-top:6px">${p.estimatedFeeNote}</p>`;
+      <div class="row"><span>نقطه ورود (Entry)</span><span>${fmt(p.entry)}</span></div>
+      <div class="row"><span>حد ضرر (Stop Loss)</span><span>${fmt(p.stopLoss)}</span></div>
+      <div class="row"><span>حد سود ۱ (TP1)</span><span>${fmt(p.takeProfit1)} (R:R ${p.riskRewardTP1 ?? '—'})</span></div>
+      <div class="row"><span>حد سود ۲ (TP2)</span><span>${fmt(p.takeProfit2)} (R:R ${p.riskRewardTP2 ?? '—'})</span></div>
+      <div class="row"><span>حد سود ۳ (TP3)</span><span>${fmt(p.takeProfit3)} (R:R ${p.riskRewardTP3 ?? '—'})</span></div>
+      <div class="row"><span>لوریج پیشنهادی (آموزشی)</span><span>${escapeHTML(p.suggestedLeverage || '—')}</span></div>
+      ${posSizing ? `<div class="row"><span>سایز پوزیشن</span><span>${posSizing.units} واحد (${posSizing.positionValueUSDT} USDT)</span></div>
+      <p class="muted">با سرمایهٔ ${capital} USDT و ریسک ${riskPct}٪، حداکثر ضرر مجاز این ترید ${posSizing.riskAmountUSDT} USDT است.</p>` : '<p class="muted">برای محاسبهٔ سایز پوزیشن، سرمایه و درصد ریسک را وارد کن.</p>'}
+      <p class="muted" style="margin-top:6px">${escapeHTML(p.estimatedFeeNote || 'کارمزد در این برنامه به‌صورت زنده محاسبه نمی‌شود.')}</p>`;
   }
   if(res.risk || res.watchLong || res.watchShort){
     riskCard.style.display='block';
@@ -1025,25 +1105,25 @@ function renderResult(res, symbol, interval, lastClosedTime){
 
   document.getElementById('srCard').style.display='block';
   document.getElementById('staticSR').innerHTML =
-    (res.resistances.length? '<b>مقاومت‌ها:</b><br>'+res.resistances.map(r=>`<span>🔴 ${r.price.toFixed(4)} <span class="badge" style="background:rgba(239,83,80,.2);color:var(--red)">قدرت ${r.strength}</span></span>`).join('') : '<span class="muted">مقاومتی شناسایی نشد</span>')
-    + (res.supports.length? '<br><b>حمایت‌ها:</b><br>'+res.supports.map(s=>`<span>🟢 ${s.price.toFixed(4)} <span class="badge" style="background:rgba(38,166,154,.2);color:var(--green)">قدرت ${s.strength}</span></span>`).join('') : '<br><span class="muted">حمایتی شناسایی نشد</span>');
+    (res.resistances.length? '<b>مقاومت‌ها:</b><br>'+res.resistances.map(r=>`<span>🔴 ${fmt(r.price)} <span class="badge" style="background:rgba(239,83,80,.2);color:var(--red)">قدرت ${r.strength}</span></span>`).join('') : '<span class="muted">مقاومتی شناسایی نشد</span>')
+    + (res.supports.length? '<br><b>حمایت‌ها:</b><br>'+res.supports.map(s=>`<span>🟢 ${fmt(s.price)} <span class="badge" style="background:rgba(38,166,154,.2);color:var(--green)">قدرت ${s.strength}</span></span>`).join('') : '<br><span class="muted">حمایتی شناسایی نشد</span>');
   document.getElementById('dynamicSR').innerHTML =
-    `<span>EMA20: ${res.ema20.toFixed(4)}</span><span>EMA50: ${res.ema50.toFixed(4)}</span>` +
-    (res.ema200 ? `<span>EMA200: ${res.ema200.toFixed(4)}</span>` : '<span class="muted">EMA200 نیاز به داده بیشتر دارد</span>');
+    `<span>EMA20: ${fmt(res.ema20)}</span><span>EMA50: ${fmt(res.ema50)}</span>` +
+    (res.ema200 ? `<span>EMA200: ${fmt(res.ema200)}</span>` : '<span class="muted">EMA200 نیاز به داده بیشتر دارد</span>');
 
   document.getElementById('indCard').style.display='block';
-  document.getElementById('ind_rsi').textContent = res.rsiVal.toFixed(1);
-  document.getElementById('ind_macd').textContent = `${res.macdVal.macd.toFixed(4)} / سیگنال ${res.macdVal.signal.toFixed(4)} / هیست ${res.macdVal.hist.toFixed(4)}`;
-  document.getElementById('ind_ema').textContent = `${res.ema20.toFixed(4)} / ${res.ema50.toFixed(4)} / ${res.ema200? res.ema200.toFixed(4):'—'}`;
-  document.getElementById('ind_atr').textContent = res.atrVal.toFixed(4);
+  document.getElementById('ind_rsi').textContent = fmt(res.rsiVal,1);
+  document.getElementById('ind_macd').textContent = `${fmt(res.macdVal?.macd)} / سیگنال ${fmt(res.macdVal?.signal)} / هیست ${fmt(res.macdVal?.hist)}`;
+  document.getElementById('ind_ema').textContent = `${fmt(res.ema20)} / ${fmt(res.ema50)} / ${res.ema200? fmt(res.ema200):'—'}`;
+  document.getElementById('ind_atr').textContent = fmt(res.atrVal);
   const ichRow=document.getElementById('ind_ichimoku');
   if(ichRow) ichRow.textContent=res.ichimoku?`${res.ichimoku.priceVsCloud} | TK ${res.ichimoku.tkCross} | ${res.ichimoku.score}/100`: '—';
-  const vr=document.getElementById('ind_volratio'); if(vr) vr.textContent=res.volumeMetrics?`${res.volumeMetrics.ratio.toFixed(2)}x`: '—';
+  const vr=document.getElementById('ind_volratio'); if(vr) vr.textContent=res.volumeMetrics?`${fmt(res.volumeMetrics?.ratio,2)}x`: '—';
 
   const bbRow=document.getElementById('ind_bb_row'), stochRow=document.getElementById('ind_stoch_row'), adxRow=document.getElementById('ind_adx_row');
-  if(bbRow){ bbRow.style.display='flex'; document.getElementById('ind_bb').textContent = `${res.bb.lower.toFixed(4)} / ${res.bb.mid.toFixed(4)} / ${res.bb.upper.toFixed(4)}`; }
-  if(stochRow){ stochRow.style.display='flex'; document.getElementById('ind_stoch').textContent = `K=${res.stoch.k.toFixed(1)} D=${res.stoch.d.toFixed(1)}`; }
-  if(adxRow){ adxRow.style.display='flex'; document.getElementById('ind_adx').textContent = `${res.adxVal.adx.toFixed(1)} (${res.adxVal.adx>=25?'روند قوی':'رنج/ضعیف'})`; }
+  if(bbRow){ bbRow.style.display='flex'; document.getElementById('ind_bb').textContent = `${fmt(res.bb?.lower)} / ${fmt(res.bb?.mid)} / ${fmt(res.bb?.upper)}`; }
+  if(stochRow){ stochRow.style.display='flex'; document.getElementById('ind_stoch').textContent = `K=${fmt(res.stoch?.k,1)} D=${fmt(res.stoch?.d,1)}`; }
+  if(adxRow){ adxRow.style.display='flex'; document.getElementById('ind_adx').textContent = `${fmt(res.adxVal?.adx,1)} (${res.adxVal.adx>=25?'روند قوی':'رنج/ضعیف'})`; }
 
   document.getElementById('paCard').style.display='block';
   const candleTags = res.patterns.map(p=>`<span class="tag ${p.dir==='up'?'tag-up':p.dir==='down'?'tag-down':'tag-neu'}">${p.name}</span>`).join(' ');
@@ -1083,7 +1163,8 @@ function renderResult(res, symbol, interval, lastClosedTime){
 
 // ---------- لایه اختیاری AI (فقط بازنویسی روایت بر اساس داده واقعی) ----------
 async function maybeCallAI(res, symbol, interval){
-  const settings = JSON.parse(localStorage.getItem('ta_settings') || '{}');
+  let settings={};
+  try{ settings=JSON.parse(localStorage.getItem('ta_settings') || '{}') || {}; }catch(e){ settings={}; }
   const aiCard = document.getElementById('aiCard');
   if(!settings.provider || settings.provider === 'none' || !settings.apiKey){
     aiCard.style.display = 'none';
@@ -1310,8 +1391,12 @@ async function deepAnalyzeSymbol(symbol, workingTf='1h', htfTf='4h'){
 
 function scannerCardHTML(item, kind){
   const dirTag = kind==='long' ? '🟢 LONG' : kind==='short' ? '🔴 SHORT' : '🟡 WATCH';
-  const plan = kind==='long' ? (item.risk?.direction==='LONG'?item.risk:item.watchLong) : kind==='short' ? (item.risk?.direction==='SHORT'?item.risk:item.watchShort) : (item.watchLong||item.watchShort);
-  const planLine = plan ? `Entry: ${plan.entry.toFixed(4)} | SL: ${plan.stopLoss.toFixed(4)} | TP1: ${plan.takeProfit1.toFixed(4)} | TP2: ${plan.takeProfit2.toFixed(4)} | TP3: ${plan.takeProfit3.toFixed(4)}` : 'داده کافی برای ستاپ عددی نیست';
+  const plan = kind==='long' ? (validPlan(item.risk)&&item.risk.direction==='LONG'?item.risk:(validPlan(item.watchLong)?item.watchLong:null))
+    : kind==='short' ? (validPlan(item.risk)&&item.risk.direction==='SHORT'?item.risk:(validPlan(item.watchShort)?item.watchShort:null))
+    : (validPlan(item.watchLong)?item.watchLong:(validPlan(item.watchShort)?item.watchShort:null));
+  const planLine = validPlan(plan)
+    ? `Entry: ${fmt(plan.entry)} | SL: ${fmt(plan.stopLoss)} | TP1: ${fmt(plan.takeProfit1)} | TP2: ${fmt(plan.takeProfit2)} | TP3: ${fmt(plan.takeProfit3)}`
+    : 'داده کافی برای ستاپ عددی معتبر نیست';
   const patternLine = item.chartPattern ? item.chartPattern.type : (item.patterns?.length ? item.patterns.map(p=>p.name).join('، ') : '—');
   return `<div class="card" style="margin-bottom:8px">
     <div class="row" style="border:none"><b>${item.symbol.replace('USDT','/USDT')}</b><span>${dirTag}</span></div>
@@ -1376,6 +1461,19 @@ async function runMarketScan(){
 
 els.scanBtn.onclick = runMarketScan;
 els.scanCloseBtn.onclick = () => { els.scannerOverlay.style.display='none'; };
+
+// ---------- خطایابی سراسری ----------
+// خطاهای runtime نباید کل UI را از کار بیندازند؛ جزئیات در console و پیام قابل‌فهم نمایش داده می‌شود.
+window.addEventListener('error', e=>{
+  console.error('Runtime error:', e.error || e.message);
+  if(els.verdictBox && !els.verdictBox.textContent.startsWith('خطا:')){
+    els.verdictBox.className='verdict v-none';
+    els.verdictBox.textContent='خطای داخلی موتور تحلیل: '+(e.message||'خطای نامشخص')+' — جزئیات در Console ثبت شد.';
+  }
+});
+window.addEventListener('unhandledrejection', e=>{
+  console.error('Unhandled promise rejection:', e.reason);
+});
 
 // ---------- اجرای اصلی ----------
 async function run(){

@@ -214,15 +214,19 @@ function emaSeries(values, len){
   return emaArr;
 }
 function rsi(closes, len=14){
-  let gains=0, losses=0;
-  for(let i=closes.length-len; i<closes.length; i++){
-    const diff = closes[i]-closes[i-1];
-    if(diff>=0) gains+=diff; else losses-=diff;
+  if(!Array.isArray(closes) || closes.length < len+1) return null;
+  let gain=0, loss=0;
+  for(let i=1;i<=len;i++){ const d=closes[i]-closes[i-1]; if(d>0) gain+=d; else loss-=d; }
+  let avgGain=gain/len, avgLoss=loss/len;
+  for(let i=len+1;i<closes.length;i++){
+    const d=closes[i]-closes[i-1], g=Math.max(d,0), l=Math.max(-d,0);
+    avgGain=(avgGain*(len-1)+g)/len;
+    avgLoss=(avgLoss*(len-1)+l)/len;
   }
-  const avgG=gains/len, avgL=losses/len;
-  if(avgL===0) return 100;
-  const rs=avgG/avgL;
-  return 100 - (100/(1+rs));
+  if(avgLoss===0) return 100;
+  if(avgGain===0) return 0;
+  const rs=avgGain/avgLoss;
+  return 100-(100/(1+rs));
 }
 function macd(closes){
   const ema12 = emaSeries(closes,12);
@@ -233,12 +237,15 @@ function macd(closes){
   return { macd: macdLine.at(-1), signal: signal.at(-1), hist: hist.at(-1), prevHist: hist.at(-2) };
 }
 function atr(candles, len=14){
-  let trs=[];
+  if(!Array.isArray(candles) || candles.length < len+1) return null;
+  const tr=[];
   for(let i=1;i<candles.length;i++){
     const c=candles[i], p=candles[i-1];
-    trs.push(Math.max(c.high-c.low, Math.abs(c.high-p.close), Math.abs(c.low-p.close)));
+    tr.push(Math.max(c.high-c.low,Math.abs(c.high-p.close),Math.abs(c.low-p.close)));
   }
-  return sma(trs.slice(-len), len);
+  let a=tr.slice(0,len).reduce((x,y)=>x+y,0)/len;
+  for(let i=len;i<tr.length;i++) a=(a*(len-1)+tr[i])/len;
+  return a;
 }
 function stddev(arr, len){
   const slice = arr.slice(-len);
@@ -267,19 +274,29 @@ function stochastic(candles, len=14, smoothK=3){
 }
 // ADX ساده برای سنجش قدرت روند (نه جهت)
 function adx(candles, len=14){
-  let plusDM=[], minusDM=[], tr=[];
+  if(!Array.isArray(candles) || candles.length < len*2+1) return {adx:null,plusDI:null,minusDI:null};
+  const tr=[], plusDM=[], minusDM=[];
   for(let i=1;i<candles.length;i++){
-    const up = candles[i].high - candles[i-1].high;
-    const down = candles[i-1].low - candles[i].low;
-    plusDM.push(up>down && up>0 ? up : 0);
-    minusDM.push(down>up && down>0 ? down : 0);
-    tr.push(Math.max(candles[i].high-candles[i].low, Math.abs(candles[i].high-candles[i-1].close), Math.abs(candles[i].low-candles[i-1].close)));
+    const c=candles[i], p=candles[i-1];
+    const up=c.high-p.high, down=p.low-c.low;
+    tr.push(Math.max(c.high-c.low,Math.abs(c.high-p.close),Math.abs(c.low-p.close)));
+    plusDM.push(up>down && up>0?up:0);
+    minusDM.push(down>up && down>0?down:0);
   }
-  const atrN = sma(tr.slice(-len), len);
-  const plusDI = 100 * sma(plusDM.slice(-len), len) / (atrN||1);
-  const minusDI = 100 * sma(minusDM.slice(-len), len) / (atrN||1);
-  const dx = 100 * Math.abs(plusDI-minusDI) / ((plusDI+minusDI)||1);
-  return { adx: dx, plusDI, minusDI };
+  let atrW=tr.slice(0,len).reduce((a,b)=>a+b,0)/len;
+  let pW=plusDM.slice(0,len).reduce((a,b)=>a+b,0)/len;
+  let mW=minusDM.slice(0,len).reduce((a,b)=>a+b,0)/len;
+  const dx=[]; let lastP=0,lastM=0;
+  for(let i=len;i<tr.length;i++){
+    atrW=(atrW*(len-1)+tr[i])/len; pW=(pW*(len-1)+plusDM[i])/len; mW=(mW*(len-1)+minusDM[i])/len;
+    const pdi=100*pW/(atrW||1), mdi=100*mW/(atrW||1);
+    lastP=pdi; lastM=mdi;
+    dx.push(100*Math.abs(pdi-mdi)/((pdi+mdi)||1));
+  }
+  if(!dx.length) return {adx:null,plusDI:lastP,minusDI:lastM};
+  let adxW=dx.slice(0,len).reduce((a,b)=>a+b,0)/Math.min(len,dx.length);
+  for(let i=Math.min(len,dx.length);i<dx.length;i++) adxW=(adxW*(len-1)+dx[i])/len;
+  return {adx:adxW,plusDI:lastP,minusDI:lastM};
 }
 // واگرایی ساده RSI بین دو سوینگ اخیر قیمت
 function detectRSIDivergence(candles, closes){
@@ -310,19 +327,24 @@ function detectRSIDivergence(candles, closes){
 }
 
 // ---------- فیبوناچی روی آخرین لگ سوینگ قابل توجه ----------
-function fibonacci(candles, lookback=80){
-  const win = candles.slice(-lookback);
-  let hiIdx=0, loIdx=0;
-  win.forEach((c,i)=>{ if(c.high>win[hiIdx].high) hiIdx=i; if(c.low<win[loIdx].low) loIdx=i; });
-  const hi = win[hiIdx].high, lo = win[loIdx].low;
-  const impulseUp = hiIdx > loIdx; // آخرین حرکت مهم صعودی بوده یا نزولی
-  const diff = hi - lo;
-  const ratios = [0.236,0.382,0.5,0.618,0.786];
-  const levels = {};
-  ratios.forEach(r=>{
-    levels[r] = impulseUp ? hi - diff*r : lo + diff*r;
-  });
-  return { high:hi, low:lo, impulseUp, levels };
+function fibonacci(candles, lookback=100){
+  const win=candles.slice(-lookback); if(win.length<20) return null;
+  const piv=[]; const lb=3;
+  for(let i=lb;i<win.length-lb;i++){
+    const c=win[i], w=win.slice(i-lb,i+lb+1);
+    if(c.high===Math.max(...w.map(x=>x.high))) piv.push({i,price:c.high,type:'H'});
+    if(c.low===Math.min(...w.map(x=>x.low))) piv.push({i,price:c.low,type:'L'});
+  }
+  piv.sort((a,b)=>a.i-b.i);
+  const alt=[];
+  for(const p of piv){ const last=alt.at(-1); if(!last){alt.push(p);continue;} if(last.type===p.type){ if(p.type==='H'&&p.price>last.price)alt[alt.length-1]=p; if(p.type==='L'&&p.price<last.price)alt[alt.length-1]=p; } else alt.push(p); }
+  if(alt.length<2) return null;
+  const a=alt.at(-2), b=alt.at(-1); const hi=Math.max(a.price,b.price), lo=Math.min(a.price,b.price); const diff=hi-lo;
+  if(!(diff>0)) return null;
+  const impulseUp=a.type==='L'&&b.type==='H';
+  const ratios=[0.236,0.382,0.5,0.618,0.786]; const levels={};
+  ratios.forEach(r=>levels[r]=impulseUp?hi-diff*r:lo+diff*r);
+  return {high:hi,low:lo,impulseUp,levels,from:a,to:b};
 }
 
 // ---------- VWAP (میانگین وزنی حجمی) روی بازهٔ دادهٔ دریافتی ----------
@@ -449,72 +471,41 @@ function linReg(points){
 }
 
 // ---------- تشخیص کانال‌ها و مثلث‌ها (بر اساس خطوط برازش‌شده روی سوئینگ‌های اخیر) ----------
-function detectChartPatterns(candles, lookback=3, minSwings=3){
-  const n = candles.length;
-  const highsIdx=[], lowsIdx=[];
+function detectChartPatterns(candles, lookback=3, minSwings=3, atrVal=null, volumeRatio=1){
+  const n=candles.length, highsIdx=[], lowsIdx=[];
   for(let i=lookback;i<n-lookback;i++){
-    const win = candles.slice(i-lookback, i+lookback+1);
-    const cur = candles[i];
-    if(cur.high === Math.max(...win.map(c=>c.high))) highsIdx.push({x:i, y:cur.high});
-    if(cur.low === Math.min(...win.map(c=>c.low))) lowsIdx.push({x:i, y:cur.low});
+    const win=candles.slice(i-lookback,i+lookback+1), cur=candles[i];
+    if(cur.high===Math.max(...win.map(c=>c.high))) highsIdx.push({x:i,y:cur.high});
+    if(cur.low===Math.min(...win.map(c=>c.low))) lowsIdx.push({x:i,y:cur.low});
   }
-  const recentHighs = highsIdx.slice(-5);
-  const recentLows = lowsIdx.slice(-5);
-  if(recentHighs.length < minSwings || recentLows.length < minSwings) return null;
-
-  const upper = linReg(recentHighs);
-  const lower = linReg(recentLows);
-  const lastIdx = n-1;
-  const lastClose = candles[n-1].close;
-  const upperNow = upper.slope*lastIdx + upper.intercept;
-  const lowerNow = lower.slope*lastIdx + lower.intercept;
-  if(upperNow <= lowerNow) return null; // خطوط نامعتبر (تقاطع اشتباه)
-
-  const widthNow = upperNow - lowerNow;
-  const startX = Math.min(recentHighs[0].x, recentLows[0].x);
-  const upperStart = upper.slope*startX + upper.intercept;
-  const lowerStart = lower.slope*startX + lower.intercept;
-  const widthStart = Math.max(upperStart - lowerStart, 1e-9);
-
-  const avgPrice = (upperNow+lowerNow)/2;
-  const slopeThreshold = avgPrice * 0.0006; // برای تشخیص «تقریباً افقی»
-
-  const upFlat = Math.abs(upper.slope) < slopeThreshold;
-  const lowFlat = Math.abs(lower.slope) < slopeThreshold;
-  const upUp = upper.slope > slopeThreshold;
-  const upDown = upper.slope < -slopeThreshold;
-  const lowUp = lower.slope > slopeThreshold;
-  const lowDown = lower.slope < -slopeThreshold;
-
-  let type=null, dirBias='neutral';
-  const converging = widthNow < widthStart*0.85;
-  const diverging = widthNow > widthStart*1.15;
-
+  const recentHighs=highsIdx.slice(-5), recentLows=lowsIdx.slice(-5);
+  if(recentHighs.length<minSwings||recentLows.length<minSwings) return null;
+  const upper=linReg(recentHighs), lower=linReg(recentLows), lastIdx=n-1, close=candles.at(-1).close;
+  const upperNow=upper.slope*lastIdx+upper.intercept, lowerNow=lower.slope*lastIdx+lower.intercept;
+  if(!(upperNow>lowerNow)) return null;
+  const startX=Math.min(recentHighs[0].x,recentLows[0].x);
+  const widthNow=upperNow-lowerNow, widthStart=Math.max(upper.slope*startX+upper.intercept-(lower.slope*startX+lower.intercept),1e-9);
+  const avgPrice=(upperNow+lowerNow)/2, slopeThreshold=avgPrice*0.0006;
+  const upFlat=Math.abs(upper.slope)<slopeThreshold, lowFlat=Math.abs(lower.slope)<slopeThreshold;
+  const upUp=upper.slope>slopeThreshold, upDown=upper.slope<-slopeThreshold, lowUp=lower.slope>slopeThreshold, lowDown=lower.slope<-slopeThreshold;
+  const converging=widthNow<widthStart*.85, diverging=widthNow>widthStart*1.15;
+  let type=null,dirBias='neutral';
   if(converging){
-    if(upFlat && lowUp){ type='مثلث صعودی (Ascending Triangle)'; dirBias='up'; }
-    else if(upDown && lowFlat){ type='مثلث نزولی (Descending Triangle)'; dirBias='down'; }
-    else if(upDown && lowUp){ type='مثلث متقارن (Symmetrical Triangle)'; dirBias='neutral'; }
-    else if(upDown && lowDown){ type='کانال نزولی همگرا (Falling Wedge)'; dirBias='up'; }
-    else if(upUp && lowUp){ type='کانال صعودی همگرا (Rising Wedge)'; dirBias='down'; }
-  } else if(diverging){
-    type='الگوی گسترش‌یابنده / بادبزنی (Broadening Formation)'; dirBias='neutral';
-  } else {
-    if(upUp && lowUp){ type='کانال صعودی (Ascending Channel)'; dirBias='up'; }
-    else if(upDown && lowDown){ type='کانال نزولی (Descending Channel)'; dirBias='down'; }
-    else if(upFlat && lowFlat){ type='کانال رنج / محدوده خنثی (Horizontal Range)'; dirBias='neutral'; }
-  }
-  if(!type) return null;
-
-  let status, breakout=null;
-  if(lastClose > upperNow){ status='شکست به بالای خط بالایی الگو (Breakout بالقوه — نیازمند تأیید کندل بسته و حجم)'; breakout='up'; }
-  else if(lastClose < lowerNow){ status='شکست به پایین خط پایینی الگو (Breakdown بالقوه — نیازمند تأیید کندل بسته و حجم)'; breakout='down'; }
-  else status='قیمت هنوز داخل الگو در حال نوسان است — بدون شکست تأییدشده';
-
-  return {
-    type, dirBias, status, breakout,
-    upperLineNow: +upperNow.toFixed(6), lowerLineNow: +lowerNow.toFixed(6),
-    upperSlope: upper.slope, lowerSlope: lower.slope
-  };
+    if(upFlat&&lowUp){type='مثلث صعودی (Ascending Triangle)';dirBias='up';}
+    else if(upDown&&lowFlat){type='مثلث نزولی (Descending Triangle)';dirBias='down';}
+    else if(upDown&&lowUp){type='مثلث متقارن (Symmetrical Triangle)';dirBias='neutral';}
+    else if(upDown&&lowDown){type='Falling Wedge';dirBias='up';}
+    else if(upUp&&lowUp){type='Rising Wedge';dirBias='down';}
+  }else if(diverging){type='Broadening Formation';dirBias='neutral';}
+  else if(upUp&&lowUp){type='Ascending Channel';dirBias='up';}
+  else if(upDown&&lowDown){type='Descending Channel';dirBias='down';}
+  else if(upFlat&&lowFlat){type='Horizontal Range';dirBias='neutral';}
+  if(!type)return null;
+  const atrBuf=(atrVal||close*.005)*.15;
+  let breakoutCandidate=null,breakout=null,status='داخل الگو — شکست تأیید نشده';
+  if(close>upperNow){breakoutCandidate='up'; const confirmed=close>upperNow+atrBuf && volumeRatio>=1.15; breakout=confirmed?'up':null; status=confirmed?'Breakout صعودی تأییدشده با بسته‌شدن و حجم نسبی':'Breakout صعودی بالقوه — نیازمند حجم/تأیید بیشتر';}
+  else if(close<lowerNow){breakoutCandidate='down'; const confirmed=close<lowerNow-atrBuf && volumeRatio>=1.15; breakout=confirmed?'down':null; status=confirmed?'Breakdown نزولی تأییدشده با بسته‌شدن و حجم نسبی':'Breakdown نزولی بالقوه — نیازمند حجم/تأیید بیشتر';}
+  return {type,dirBias,status,breakout,breakoutCandidate,upperLineNow:+upperNow.toFixed(6),lowerLineNow:+lowerNow.toFixed(6),upperSlope:upper.slope,lowerSlope:lower.slope,widthNow,widthStart};
 }
 
 // =========================================================
@@ -720,14 +711,14 @@ function volumeProfileLite(candles,bins=24,lookback=120){
 }
 
 function volumeMetrics(candles){
-  const vols=candles.map(c=>c.volume), last=vols.at(-1), avg=sma(vols.slice(-20),20);
-  const prevAvg=sma(vols.slice(-40,-20),20)||avg;
-  const ratio=avg?last/avg:1;
-  const trend=prevAvg?avg/prevAvg:1;
-  const obv=[]; let o=0;
-  for(let i=1;i<candles.length;i++){ if(candles[i].close>candles[i-1].close)o+=candles[i].volume; else if(candles[i].close<candles[i-1].close)o-=candles[i].volume; obv.push(o); }
-  const obvSlope=obv.length>=10 ? obv.at(-1)-obv.at(-10) : 0;
-  return {last,avg,ratio,trend,obvSlope,expanding:ratio>=1.25,contracting:ratio<=0.75};
+  if(!candles||candles.length<30)return {last:0,avg:0,ratio:1,trend:1,obvSlope:0,expanding:false,contracting:false,upVolumeRatio:1,downVolumeRatio:1};
+  const vols=candles.map(c=>c.volume), last=vols.at(-1), avg=sma(vols.slice(-20),20), prevAvg=sma(vols.slice(-40,-20),20)||avg;
+  const ratio=avg?last/avg:1, trend=prevAvg?avg/prevAvg:1;
+  let up=0,down=0;
+  candles.slice(-20).forEach((c,i,a)=>{ const prev=i? a[i-1].close : candles.at(-21)?.close; if(prev==null)return; if(c.close>prev)up+=c.volume; else if(c.close<prev)down+=c.volume; });
+  const obv=[];let o=0;for(let i=1;i<candles.length;i++){if(candles[i].close>candles[i-1].close)o+=candles[i].volume;else if(candles[i].close<candles[i-1].close)o-=candles[i].volume;obv.push(o);}
+  const obvSlope=obv.length>=10?obv.at(-1)-obv.at(-10):0;
+  return {last,avg,ratio,trend,obvSlope,expanding:ratio>=1.25,contracting:ratio<=.75,upVolumeRatio:avg?up/(avg*10):1,downVolumeRatio:avg?down/(avg*10):1};
 }
 
 function advancedStructure(candles, atrVal){
@@ -871,7 +862,29 @@ function buildProfessionalPlan(dir,entry,atrVal,supports=[],resistances=[],quali
   };
 }
 
-function analyze(candles, htfCandles){
+function deriveTrendState(candles){
+  if(!candles||candles.length<60)return {available:false};
+  const closes=candles.map(c=>c.close), e20=emaSeries(closes,20).at(-1), e50=emaSeries(closes,50).at(-1), e200=closes.length>=200?emaSeries(closes,200).at(-1):null;
+  const st=advancedStructure(candles,atr(candles,14)); const last=closes.at(-1);
+  let trend='mixed';
+  if(last>e20&&e20>e50&&(e200==null||e50>e200))trend='up';
+  else if(last<e20&&e20<e50&&(e200==null||e50<e200))trend='down';
+  let score=trend==='up'?1:trend==='down'?-1:0;
+  if(st?.event?.includes('صعودی'))score=Math.min(1,score+.35);
+  if(st?.event?.includes('نزولی'))score=Math.max(-1,score-.35);
+  return {available:true,trend,lastClose:last,ema20:e20,ema50:e50,ema200:e200,score,structure:st?.structure,event:st?.event,rsi:rsi(closes,14)};
+}
+function mtfConfluence(snapshot, workingTf='1h'){
+  if(!snapshot)return {score:0,available:false,details:{}};
+  const weights={'1d':.30,'4h':.30,'1h':.25,'15m':.15,'5m':.08};
+  let sum=0,w=0;const details={};
+  Object.entries(weights).forEach(([tf,wt])=>{const q=snapshot[tf];if(q?.available&&Number.isFinite(q.score)){sum+=q.score*wt;w+=wt;details[tf]=q.score;}});
+  const score=w?clamp(sum/w,-1,1):0;
+  const htf4=snapshot['4h']?.score??0, htf1d=snapshot['1d']?.score??0;
+  return {score,available:w>0,details,htfConflict:(htf4*score<-.20||htf1d*score<-.20)};
+}
+
+function analyze(candles, htfCandles, mtfSnapshot=null){
   if(!candles || candles.length<100) return {insufficient:true};
   const closes=candles.map(c=>c.close), volumes=candles.map(c=>c.volume), lastClose=closes.at(-1);
   const ema20=emaSeries(closes,20).at(-1), ema50=emaSeries(closes,50).at(-1), ema200=closes.length>=200?emaSeries(closes,200).at(-1):null;
@@ -879,13 +892,14 @@ function analyze(candles, htfCandles){
   const divergence=detectRSIDivergence(candles,closes), fib=fibonacci(candles,80), vwapVal=vwap(candles.slice(-200));
   const structure=advancedStructure(candles,atrVal), legacyStructure=marketStructure(candles), ich=ichimoku(candles);
   const volume=volumeMetrics(candles), vp=volumeProfileLite(candles), liquidity=findLiquidityPools(candles,60,0.1), orderBlock=findOrderBlock(candles,atrVal), fvgs=findFVGs(candles,40);
-  const chartPattern=detectChartPatterns(candles), classicalPatterns=detectClassicalPatterns(candles,structure);
+  const chartPattern=detectChartPatterns(candles,3,3,atrVal,volume.ratio), classicalPatterns=detectClassicalPatterns(candles,structure);
   const patterns=[...detectPatterns(candles),...classicalPatterns.map(p=>({name:p.name+' — '+p.status,dir:p.dir}))];
   const waveEngine=wavePressureV2(candles,atrVal,chartPattern,structure,volume);
   const {highs,lows}=findSwingPoints(candles,3);
   const resistances=clusterLevels(highs.filter(x=>x>lastClose),0.15).sort((a,b)=>a.price-b.price).slice(0,4);
   const supports=clusterLevels(lows.filter(x=>x<lastClose),0.15).sort((a,b)=>b.price-a.price).slice(0,4);
-  const htfTrend=htfCandles&&htfCandles.length>=80 ? (()=>{const hc=htfCandles.map(c=>c.close),e20=emaSeries(hc,20).at(-1),e50=emaSeries(hc,50).at(-1),l=hc.at(-1);return l>e20&&e20>e50?'up':l<e20&&e20<e50?'down':'mixed';})() : null;
+  const htfTrend=htfCandles&&htfCandles.length>=80 ? deriveTrendState(htfCandles).trend : null;
+  const mtf=mtfConfluence(mtfSnapshot);
   const nearestRes=resistances[0]?.price, nearestSup=supports[0]?.price;
 
   // هر جزء ابتدا به بازه -1..+1 نرمال می‌شود؛ اندیکاتورهای کم‌ارزش عمداً وزن پایین دارند.
@@ -893,29 +907,39 @@ function analyze(candles, htfCandles){
   let structureRaw=structure.structure.startsWith('صعودی')?0.75:structure.structure.startsWith('نزولی')?-0.75:0;
   if(structure.event?.includes('صعودی'))structureRaw=Math.max(structureRaw,.95); if(structure.event?.includes('نزولی'))structureRaw=Math.min(structureRaw,-.95);
   const ichRaw=ich?clamp((ich.score-50)/50,-1,1):0;
-  const htfRaw=htfTrend==='up'?1:htfTrend==='down'?-1:0;
-  let srRaw=0; if(nearestSup && pctDistance(lastClose,nearestSup)<1)srRaw+=.45; if(nearestRes && pctDistance(lastClose,nearestRes)<1)srRaw-=.45;
-  if(lastClose>nearestRes)srRaw+=.8; if(lastClose<nearestSup)srRaw-=.8;
-  let volRaw=clamp((volume.ratio-1)*1.5,-1,1); if(lastClose<closes.at(-2))volRaw=-Math.abs(volRaw); else volRaw=Math.abs(volRaw);
+  const htfRaw=mtf.available ? mtf.score : (htfTrend==='up'?1:htfTrend==='down'?-1:0);
+  let srRaw=0;
+  if(nearestSup && pctDistance(lastClose,nearestSup)<.75) srRaw+=.35;
+  if(nearestRes && pctDistance(lastClose,nearestRes)<.75) srRaw-=.35;
+  if(nearestRes && lastClose>nearestRes+atrVal*.15) srRaw+=.65;
+  if(nearestSup && lastClose<nearestSup-atrVal*.15) srRaw-=.65;
+  if(vwapVal && pctDistance(lastClose,vwapVal)<.35) srRaw += lastClose>=vwapVal?.15:-.15;
+  let volRaw=clamp((volume.ratio-1)*1.25,-1,1);
+  if(lastClose>closes.at(-2)) volRaw=Math.min(1,volRaw + (volume.upVolumeRatio>volume.downVolumeRatio?.15:-.05));
+  else volRaw=Math.max(-1,volRaw - (volume.downVolumeRatio>volume.upVolumeRatio?.15:-.05));
+  if(volume.obvSlope>0&&lastClose>vwapVal) volRaw=Math.min(1,volRaw+.10);
+  if(volume.obvSlope<0&&lastClose<vwapVal) volRaw=Math.max(-1,volRaw-.10);
   let paRaw=0; patterns.forEach(p=>{paRaw+=p.dir==='up'?.35:p.dir==='down'?-.35:0}); paRaw=clamp(paRaw,-1,1);
   const waveRaw=waveEngine?clamp((waveEngine.bullishPressure-waveEngine.bearishPressure)/50,-1,1):0;
   let patRaw=chartPattern?.dirBias==='up'?.7:chartPattern?.dirBias==='down'?-.7:0;
   if(classicalPatterns.some(p=>p.status==='CONFIRMED')) patRaw += classicalPatterns.filter(p=>p.status==='CONFIRMED').reduce((a,p)=>a+(p.dir==='up'?.25:-.25),0);
   patRaw=clamp(patRaw,-1,1);
-  let momRaw=0; if(macdVal.hist>0)momRaw+=.35; else momRaw-=.35; if(rsiVal>55&&rsiVal<70)momRaw+=.25; if(rsiVal<45&&rsiVal>30)momRaw-=.25; if(divergence?.bullishDiv)momRaw+=.25; if(divergence?.bearishDiv)momRaw-=.25; momRaw=clamp(momRaw,-1,1);
-  let smcRaw=0; if(orderBlock)smcRaw+=orderBlock.dir==='bull'?.25:-.25; if(liquidity?.sweep)smcRaw+=liquidity.sweep.includes('صعودی')?.4:-.4; smcRaw=clamp(smcRaw,-1,1);
+  let momRaw=0; if(macdVal.hist>0)momRaw+=.30; else momRaw-=.30; if(macdVal.hist>macdVal.prevHist)momRaw+=.15; else if(macdVal.hist<macdVal.prevHist)momRaw-=.15; if(rsiVal>55&&rsiVal<70)momRaw+=.22; if(rsiVal<45&&rsiVal>30)momRaw-=.22; if(divergence?.bullishDiv)momRaw+=.20; if(divergence?.bearishDiv)momRaw-=.20; momRaw=clamp(momRaw,-1,1);
+  let smcRaw=0; if(orderBlock)smcRaw+=orderBlock.dir==='bull'?.25:-.25; if(liquidity?.sweep)smcRaw+=liquidity.sweep.includes('صعودی')?.4:-.4; if(fvgs?.length){const nearFvg=fvgs.find(g=>lastClose>=g.bottom&&lastClose<=g.top||pctDistance(lastClose,(g.top+g.bottom)/2)<.6); if(nearFvg)smcRaw+=nearFvg.dir==='bull'?.15:-.15;} smcRaw=clamp(smcRaw,-1,1);
   let fibRaw=0; if(fib){const near=[.5,.618,.382].some(r=>pctDistance(lastClose,fib.levels[r])<.5); if(near)fibRaw=fib.impulseUp?.5:-.5;}
 
   const score=weightedAnalysisScore({structure:structureRaw,trend:(trendRaw*.65+htfRaw*.35),ichimoku:ichRaw,sr:srRaw,volume:volRaw,priceAction:paRaw,wave:waveRaw,pattern:patRaw,momentum:momRaw,smc:smcRaw,fib:fibRaw});
   let directional=score.directional;
   // HTF conflict is a hard quality penalty, not an invisible offset.
   const htfConflict=(htfTrend==='up'&&directional<0)||(htfTrend==='down'&&directional>0);
-  let setupQuality=clamp(Math.round(50+directional/2 - (htfConflict?10:0) - (adxVal.adx<18?7:0)),0,100);
-  const longTrigger=Boolean((structure.event?.includes('صعودی')||chartPattern?.breakout==='up'||classicalPatterns.some(p=>p.dir==='up'&&p.status==='CONFIRMED')) && volume.ratio>=1.1 && lastClose>ema20);
-  const shortTrigger=Boolean((structure.event?.includes('نزولی')||chartPattern?.breakout==='down'||classicalPatterns.some(p=>p.dir==='down'&&p.status==='CONFIRMED')) && volume.ratio>=1.1 && lastClose<ema20);
+  let setupQuality=clamp(Math.round(50+directional/2 - (htfConflict?10:0) - (mtf.htfConflict?7:0) - (adxVal.adx!=null&&adxVal.adx<18?7:0) - (!mtf.available?5:0)),0,100);
+  const longTrigger=Boolean((structure.event?.includes('صعودی')||chartPattern?.breakout==='up'||classicalPatterns.some(p=>p.dir==='up'&&p.status==='CONFIRMED')) && volume.ratio>=1.15 && lastClose>ema20 && lastClose>closes.at(-2));
+  const shortTrigger=Boolean((structure.event?.includes('نزولی')||chartPattern?.breakout==='down'||classicalPatterns.some(p=>p.dir==='down'&&p.status==='CONFIRMED')) && volume.ratio>=1.15 && lastClose<ema20 && lastClose<closes.at(-2));
   const nearSupport=nearestSup&&pctDistance(lastClose,nearestSup)<1.0, nearResistance=nearestRes&&pctDistance(lastClose,nearestRes)<1.0;
-  const longReadiness=clamp(Math.round((setupQuality*.55)+(longTrigger?30:0)+(nearSupport?10:0)-(htfTrend==='down'?20:0)),0,100);
-  const shortReadiness=clamp(Math.round((setupQuality*.55)+(shortTrigger?30:0)+(nearResistance?10:0)-(htfTrend==='up'?20:0)),0,100);
+  const chaseLong=nearestRes && lastClose>nearestRes+atrVal*.75;
+  const chaseShort=nearestSup && lastClose<nearestSup-atrVal*.75;
+  const longReadiness=clamp(Math.round((setupQuality*.55)+(longTrigger?30:0)+(nearSupport?10:0)-(htfTrend==='down'?20:0)-(chaseLong?25:0)),0,100);
+  const shortReadiness=clamp(Math.round((setupQuality*.55)+(shortTrigger?30:0)+(nearResistance?10:0)-(htfTrend==='up'?20:0)-(chaseShort?25:0)),0,100);
   let direction=directional>=0?'LONG':'SHORT';
   const readiness=direction==='LONG'?longReadiness:shortReadiness;
   let verdictClass='v-hold', verdict='NO TRADE — کیفیت یا تریگر کافی نیست';
@@ -924,8 +948,8 @@ function analyze(candles, htfCandles){
   else if(setupQuality>=70 && directional>10){verdict='🟡 WAIT FOR LONG — ستاپ خوب است، اما ورود هنوز تأیید کامل ندارد';}
   else if(setupQuality>=70 && directional<-10){verdict='🟠 WAIT FOR SHORT — ستاپ خوب است، اما ورود هنوز تأیید کامل ندارد';}
   else if(setupQuality<60){verdict='⚪ NO TRADE — کیفیت ستاپ زیر حداقل آستانه است';}
-  const longEntry = nearSupport ? nearestSup : lastClose;
-   const shortEntry = nearResistance ? nearestRes : lastClose;
+  const longEntry = longTrigger ? lastClose : (nearestRes ?? lastClose);
+  const shortEntry = shortTrigger ? lastClose : (nearestSup ?? lastClose);
    const planLong=buildProfessionalPlan('LONG',longEntry,atrVal,supports,resistances,setupQuality,longTrigger&&longReadiness>=80);
   const planShort=buildProfessionalPlan('SHORT',shortEntry,atrVal,supports,resistances,setupQuality,shortTrigger&&shortReadiness>=80);
   const risk=verdictClass==='v-buy'&&validPlan(planLong)?planLong:verdictClass==='v-sell'&&validPlan(planShort)?planShort:null;
@@ -937,18 +961,21 @@ function analyze(candles, htfCandles){
   notes.push(`ساختار: ${structure.structure}${structure.event?' | '+structure.event:''}`);
   notes.push(`Ichimoku: ${ich?.priceVsCloud||'N/A'} | TK=${ich?.tkCross||'N/A'} | Future Cloud=${ich?.bullishFuture?'Bullish':'Bearish'}`);
   notes.push(`حجم: ${fmt(volume?.ratio,2)}x میانگین ۲۰ کندل | ADX=${fmt(adxVal?.adx,1)}`);
-  if(htfConflict)notes.push('⚠ تعارض تایم‌فریم بالاتر با جهت فعلی؛ کیفیت سیگنال کاهش داده شد.');
+  if(htfConflict||mtf.htfConflict)notes.push('⚠ تعارض تایم‌فریم بالاتر با جهت فعلی؛ کیفیت سیگنال کاهش داده شد.');
+  if(mtf.available) notes.push(`هم‌راستایی MTF: ${(mtf.score*100).toFixed(0)}/100 | 1D=${fmt(mtf.details['1d'],2)} 4H=${fmt(mtf.details['4h'],2)} 1H=${fmt(mtf.details['1h'],2)} 15M=${fmt(mtf.details['15m'],2)}`);
   if(!longTrigger&&!shortTrigger)notes.push('تریگر بسته‌شدن + حجم هنوز تأیید نشده؛ لمس سطح ورود محسوب نمی‌شود.');
+  if(chaseLong)notes.push('⚠ قیمت از تریگر/مقاومت ایده‌آل بیش از حدود 0.75 ATR عبور کرده؛ ورود تعقیبی ریسک‌دار است، پولبک/Retest را ترجیح بده.');
+  if(chaseShort)notes.push('⚠ قیمت از تریگر/حمایت ایده‌آل بیش از حدود 0.75 ATR عبور کرده؛ ورود تعقیبی ریسک‌دار است، پولبک/Retest را ترجیح بده.');
   const confidence=clamp(Math.round(setupQuality*(readiness/100)),5,95);
   return {
     lastClose,ema20,ema50,ema200,rsiVal,macdVal,atrVal,bb,stoch,adxVal,divergence,htfTrend,fib,vwapVal,structure:legacyStructure||structure,
-    advancedStructure:structure,ichimoku:ich,orderBlock,fvgs,liquidity,volumeMetrics:volume,volumeProfile:vp,resistances,supports,patterns,chartPattern,classicalPatterns,waveEngine,
+    advancedStructure:structure,ichimoku:ich,mtfConfluence:mtf,orderBlock,fvgs,liquidity,volumeMetrics:volume,volumeProfile:vp,resistances,supports,patterns,chartPattern,classicalPatterns,waveEngine,
     recentSwingHighs:highs.slice(-8),recentSwingLows:lows.slice(-8),notes,
     score:directional,setupQuality,entryReadiness:readiness,confidence,verdict,verdictClass,risk,watchLong,watchShort,
     entryState:verdictClass==='v-buy'||verdictClass==='v-sell'?'ENTRY VALID':longReadiness>=70||shortReadiness>=70?'TRIGGER FORMED':'NO SETUP',
     trendScore:Math.round(trendRaw*2),momScore:Math.round(momRaw*2),paScore:Math.round(paRaw*2),volScore:Math.round(volRaw*2),srScore:Math.round(srRaw*2),htfScore:Math.round(htfRaw*2),vwapScore:lastClose>vwapVal?1:-1,structureScore:Math.round(structureRaw*2),fibScore:Math.round(fibRaw*2),obScore:orderBlock?(orderBlock.dir==='bull'?1:-1):0,liqScore:liquidity?.sweep?(liquidity.sweep.includes('صعودی')?1:-1):0,
     componentScores:{structure:structureRaw,trend:trendRaw,ichimoku:ichRaw,supportResistance:srRaw,volume:volRaw,priceAction:paRaw,wave:waveRaw,pattern:patRaw,momentum:momRaw,smc:smcRaw,fibonacci:fibRaw},
-    dataQuality:{ok:true,closedCandles:true,candleCount:candles.length,lastClosedTime:candles.at(-1)?.closeTime}
+    dataQuality:{ok:true,closedCandles:true,candleCount:candles.length,lastClosedTime:candles.at(-1)?.closeTime,mtfAvailable:mtf.available,mtfConflict:mtf.htfConflict}
   };
 }
 
@@ -1033,6 +1060,29 @@ function renderResult(res, symbol, interval, lastClosedTime){
     document.getElementById('entryState').textContent=res.entryState||'NO SETUP';
     document.getElementById('dominantDirection').textContent=res.score>0?'LONG':res.score<0?'SHORT':'NEUTRAL';
   }
+
+  // لایهٔ حرفه‌ای معامله‌گر: قبل از هر نتیجهٔ ورود، کیفیت اجرا، ریسک، رژیم و thesis check نمایش داده می‌شود.
+  const existingPro=document.getElementById('proTraderCard');
+  if(existingPro) existingPro.remove();
+  const pro=res.proTrader||{};
+  const proCard=document.createElement('div');
+  proCard.id='proTraderCard'; proCard.className='card'; proCard.style.marginTop='10px';
+  const rr=pro.risk||{}; const ex=pro.execution||{}; const reg=pro.regime||{};
+  const dirLabel=pro.direction==='LONG'?'🟢 LONG':pro.direction==='SHORT'?'🔴 SHORT':'⚪ NEUTRAL';
+  proCard.innerHTML=`
+    <h3>🧠 لایهٔ معامله‌گر حرفه‌ای</h3>
+    <div class="row"><span>رژیم بازار</span><span>${escapeHTML(reg.label||'نامشخص')}</span></div>
+    <div class="row"><span>کیفیت اجرا</span><span>${ex.score??'—'}/100</span></div>
+    <div class="row"><span>ریسک ترید</span><span>${rr.riskPct??'—'}% | ${rr.riskAmount??'—'} USDT</span></div>
+    <div class="row"><span>R:R معتبر</span><span>${rr.rr1??'—'} / ${rr.rr2??'—'} / ${rr.rr3??'—'}</span></div>
+    <div class="row"><span>Portfolio Heat</span><span>${rr.heat??'—'}% (حداکثر پیشنهادی ${rr.maxHeat??'—'}%)</span></div>
+    <div class="row"><span>Derivatives</span><span>${res.derivatives?.status==='ok'?`Funding ${fmt(res.derivatives.fundingRate*100,4)}% | OI ${fmt(res.derivatives.openInterest,0)}`:'داده در دسترس نیست'}</span></div>
+    <div class="row"><span>تصمیم</span><span>${escapeHTML(pro.action||dirLabel)}</span></div>
+    ${pro.reasons?.length?`<p class="muted"><b>چرا:</b> ${pro.reasons.map(escapeHTML).join(' • ')}</p>`:''}
+    ${pro.killers?.length?`<p class="muted"><b>Thesis Killers:</b> ${pro.killers.map(escapeHTML).join(' • ')}</p>`:''}
+    ${pro.executionPlan?.length?`<p class="muted"><b>قانون اجرا:</b> ${pro.executionPlan.map(escapeHTML).join(' • ')}</p>`:''}
+  `;
+  qualityCard?.insertAdjacentElement('afterend',proCard);
 
   document.getElementById('scoreCard').style.display='block';
   document.getElementById('s_trend').innerHTML = label(res.trendScore);
@@ -1379,14 +1429,31 @@ async function quickFilterCandidates(tickers){
   return results.filter(Boolean);
 }
 
+async function buildCompactMTF(symbol, workingTf='1h'){
+  const tfs=[...new Set(['1d','4h',workingTf,'15m'])]; const out={};
+  const results=[];
+  for(let i=0;i<tfs.length;i+=4){
+    const batch=tfs.slice(i,i+4);
+    results.push(...await Promise.all(batch.map(async tf=>{
+      try{return [tf,deriveTrendState(await fetchKlines(symbol,tf,180))];}catch(e){return [tf,{available:false,error:e.message}];}
+    })));
+  }
+  results.forEach(([tf,v])=>out[tf]=v); return out;
+}
+
 async function deepAnalyzeSymbol(symbol, workingTf='1h', htfTf='4h'){
   try{
-    const candles = await fetchKlines(symbol, workingTf, 300);
-    const htfCandles = await fetchKlines(symbol, htfTf, 150);
-    const res = analyze(candles, htfCandles);
-    if(res.insufficient) return null;
-    return { symbol, workingTf, ...res };
-  }catch(e){ return null; }
+    const [candles,htfCandles,mtfSnapshot]=await Promise.all([
+      fetchKlines(symbol,workingTf,300),
+      fetchKlines(symbol,htfTf,180),
+      buildCompactMTF(symbol,workingTf)
+    ]);
+    let res=analyze(candles,htfCandles,mtfSnapshot);
+    if(res.insufficient)return null;
+    res=applyProTraderLayer(res,candles,symbol,workingTf);
+    res=await enrichCryptoDerivatives(res,symbol,workingTf);
+    return {symbol,workingTf,...res};
+  }catch(e){return null;}
 }
 
 function scannerCardHTML(item, kind){
@@ -1427,8 +1494,9 @@ async function runMarketScan(){
     let deep = (await Promise.all(candidateSymbols.map(s=>deepAnalyzeSymbol(s)))).filter(Boolean);
     deep = applySignalStability(deep,'scan');
 
-    const longs = deep.filter(d=>d.verdictClass==='v-buy').sort((a,b)=>(b.setupQuality||0)-(a.setupQuality||0)).slice(0,5);
-    const shorts = deep.filter(d=>d.verdictClass==='v-sell').sort((a,b)=>(b.setupQuality||0)-(a.setupQuality||0)).slice(0,5);
+    const rankScore=d=>(d.setupQuality||0)*0.55+(d.entryReadiness||0)*0.30+Math.max(0,d.confidence||0)*0.15+(d.stableRank?4:0);
+    const longs = deep.filter(d=>d.verdictClass==='v-buy').sort((a,b)=>rankScore(b)-rankScore(a)).slice(0,5);
+    const shorts = deep.filter(d=>d.verdictClass==='v-sell').sort((a,b)=>rankScore(b)-rankScore(a)).slice(0,5);
     const usedSymbols = new Set([...longs, ...shorts].map(d=>d.symbol));
     const watchlist = deep
       .filter(d=>!usedSymbols.has(d.symbol) && Math.abs(d.score)>=3 && (d.watchLong||d.watchShort))
@@ -1491,7 +1559,12 @@ async function run(){
     if(htfInterval){
       try{ htfCandles = await fetchKlines(symbol, htfInterval, 250); }catch(e){ /* اختیاری است، اگر نشد بدون تأیید چندتایم‌فریمی ادامه می‌دهیم */ }
     }
-    const res = analyze(candles, htfCandles);
+    const mtfSnapshot = await buildCompactMTF(symbol, interval);
+    let res = analyze(candles, htfCandles, mtfSnapshot);
+    if(!res.insufficient){
+      res = applyProTraderLayer(res, candles, symbol, interval);
+      res = await enrichCryptoDerivatives(res, symbol, interval);
+    }
     renderResult(res, symbol, interval, candles.at(-1)?.closeTime);
   }catch(e){
     els.verdictBox.className='verdict v-none';
@@ -1508,5 +1581,193 @@ fetch('https://api.binance.com/api/v3/exchangeInfo').then(r=>r.json()).then(d=>{
   });
 }).catch(()=>{});
 
-// بار اول
+
+/* =========================================================
+   PRO TRADER LAYER V4
+   سنتز اصول مشترک معامله‌گران حرفه‌ای:
+   - دفاع قبل از حمله: ریسک/استاپ قبل از ورود
+   - Position sizing بر مبنای فاصلهٔ invalidation
+   - عدم میانگین‌کم‌کردن ضرر
+   - Time stop برای thesisهایی که باید سریع عمل کنند
+   - تشخیص Regime و انتخاب سبک مناسب
+   - Liquidity / spread / volatility execution filter
+   - Portfolio heat و concentration guard
+   - Funding/OI به‌عنوان سنجش crowding، نه پیش‌بینی مستقل جهت
+   - Thesis killers و adverse evidence
+   - جلوگیری از double-counting شواهد هم‌بسته
+   ========================================================= */
+const PRO_TRADER_CFG={
+  minRR:1.5, preferredRR:2.0, maxRiskPct:2, maxHeatPct:4,
+  minExecution:60, maxSpreadBps:18, maxAtrPct:8,
+  timeStopBars:6, chaseAtr:0.75
+};
+
+function proClamp(v,a=0,b=100){return Math.max(a,Math.min(b,v));}
+function proFinite(v,d=null){const n=Number(v);return Number.isFinite(n)?n:d;}
+function proPct(a,b){return b?Math.abs(a-b)/Math.abs(b)*100:Infinity;}
+
+function classifyMarketRegimePro(candles,res){
+  const adx=proFinite(res?.adxVal?.adx,0), atrV=proFinite(res?.atrVal,0), close=proFinite(res?.lastClose,0);
+  const atrPct=close&&atrV?atrV/close*100:0;
+  const structure=res?.advancedStructure?.structure||'';
+  const trend=(res?.mtfConfluence?.score||0);
+  let label='رنج / نامطمئن', type='RANGE', score=50;
+  if(adx>=25 && Math.abs(trend)>=0.35){
+    type=trend>0?'TREND_UP':'TREND_DOWN'; label=trend>0?'روند صعودی':'روند نزولی'; score=75+Math.min(20,adx-25);
+  }else if(adx<18){ type='RANGE'; label='رنج / Mean Reversion'; score=65;
+  }else if(atrPct>5.5){ type='HIGH_VOL'; label='نوسان بالا / کاهش سایز'; score=45;
+  }else { type='TRANSITION'; label='Transition / Breakout Watch'; score=55; }
+  if(structure.includes('صعودی')&&type==='TREND_UP')score+=5;
+  if(structure.includes('نزولی')&&type==='TREND_DOWN')score+=5;
+  return {type,label,score:proClamp(Math.round(score)),atrPct,adx,trend};
+}
+
+function evidenceIndependencePenaltyPro(res){
+  const c=res?.componentScores||{};
+  // EMA/MTF/Ichimoku همگی تا حدی یک واقعیت را اندازه می‌گیرند؛ از شمردن چندباره جلوگیری کن.
+  const trendCluster=Math.abs((c.trend||0)) + Math.abs((c.ichimoku||0)) + Math.abs((c.structure||0));
+  const momentumCluster=Math.abs(c.momentum||0)+Math.abs(c.volume||0);
+  let penalty=0;
+  if(trendCluster>2.15)penalty+=4;
+  if(momentumCluster>1.65)penalty+=2;
+  return penalty;
+}
+
+function buildAdverseEvidencePro(res,regime){
+  const out=[]; const score=proFinite(res?.score,0);
+  if(res?.mtfConfluence?.htfConflict)out.push('HTF با جهت فعلی مخالف است');
+  if(res?.adxVal?.adx<18)out.push('قدرت روند پایین است؛ شکست‌ها مستعد Fakeout هستند');
+  if(res?.volumeMetrics?.ratio<0.85)out.push('حجم از میانگین کمتر است');
+  if(res?.ichimoku?.priceVsCloud==='inside')out.push('قیمت داخل Kumo است؛ edge ضعیف‌تر');
+  if(score>0 && res?.resistances?.[0]?.price && proPct(res.lastClose,res.resistances[0].price)<0.35)out.push('مقاومت نزدیک است و upside محدود می‌شود');
+  if(score<0 && res?.supports?.[0]?.price && proPct(res.lastClose,res.supports[0].price)<0.35)out.push('حمایت نزدیک است و downside محدود می‌شود');
+  if(regime.type==='HIGH_VOL')out.push('نوسان بالا؛ ریسک slippage و stop-out بیشتر است');
+  if(res?.derivatives?.crowding?.extreme)out.push('crowding اهرمی شدید است؛ Funding/OI را به‌عنوان هشدار ریسک در نظر بگیر');
+  return [...new Set(out)].slice(0,5);
+}
+
+function professionalPositionRiskPro(res){
+  const capital=Math.max(proFinite(els?.capitalInput?.value,0),0);
+  let riskPct=Math.min(Math.max(proFinite(els?.riskPctInput?.value,1),0.1),PRO_TRADER_CFG.maxRiskPct);
+  const regime=res?.proTrader?.regime;
+  if(regime?.type==='HIGH_VOL')riskPct=Math.min(riskPct,0.5);
+  if(regime?.type==='TRANSITION')riskPct=Math.min(riskPct,0.75);
+  const plan=res?.risk;
+  const perUnit=plan&&proFinite(plan.entry)!=null&&proFinite(plan.stopLoss)!=null?Math.abs(plan.entry-plan.stopLoss):null;
+  const amount=capital*riskPct/100;
+  const units=perUnit&&perUnit>0?amount/perUnit:0;
+  const value=units*(plan?.entry||0);
+  const heat=capital?amount/capital*100:0;
+  return {riskPct:+riskPct.toFixed(2),riskAmount:+amount.toFixed(2),units:+units.toFixed(6),positionValue:+value.toFixed(2),heat:+heat.toFixed(2),maxHeat:PRO_TRADER_CFG.maxHeatPct};
+}
+
+function validateTradePlanPro(res){
+  const p=res?.risk; if(!validPlan(p))return {valid:false,rr1:null,rr2:null,rr3:null,reason:'Entry/SL/TP ناقص'};
+  const risk=Math.abs(p.entry-p.stopLoss); if(!risk)return {valid:false,reason:'فاصله Entry/SL صفر'};
+  const rr1=Math.abs(p.takeProfit1-p.entry)/risk, rr2=Math.abs(p.takeProfit2-p.entry)/risk, rr3=Math.abs(p.takeProfit3-p.entry)/risk;
+  const valid=rr1>=PRO_TRADER_CFG.minRR;
+  return {valid,rr1:+rr1.toFixed(2),rr2:+rr2.toFixed(2),rr3:+rr3.toFixed(2),reason:valid?'':'R:R هدف اول زیر حداقل 1:1.5'};
+}
+
+function executionQualityPro(res,regime){
+  let score=100; const reasons=[];
+  const spread=proFinite(res?.execution?.spreadBps,null), atrPct=regime?.atrPct||0;
+  if(spread!=null){if(spread>PRO_TRADER_CFG.maxSpreadBps){score-=25;reasons.push('Spread بالا');}else if(spread>10){score-=10;}}
+  if(atrPct>PRO_TRADER_CFG.maxAtrPct){score-=20;reasons.push('ATR% بسیار بالا');}
+  if((res?.volumeMetrics?.ratio||1)<0.75){score-=15;reasons.push('حجم ضعیف');}
+  if(res?.proTrader?.chase){score-=20;reasons.push('ورود تعقیبی');}
+  if(res?.derivatives?.crowding?.extreme){score-=10;reasons.push('crowding اهرمی');}
+  return {score:proClamp(Math.round(score)),reasons};
+}
+
+function applyProTraderLayer(res,candles,symbol,interval){
+  if(!res||res.insufficient)return res;
+  const regime=classifyMarketRegimePro(candles,res);
+  const direction=res.score>0?'LONG':res.score<0?'SHORT':'NEUTRAL';
+  const planCheck=validateTradePlanPro(res);
+  const chase=direction==='LONG' && res?.resistances?.[0]?.price && res.lastClose>res.resistances[0].price+(res.atrVal||0)*PRO_TRADER_CFG.chaseAtr
+    || direction==='SHORT' && res?.supports?.[0]?.price && res.lastClose<res.supports[0].price-(res.atrVal||0)*PRO_TRADER_CFG.chaseAtr;
+  const pro={direction,regime,chase:Boolean(chase)};
+  res.proTrader=pro;
+  const penalty=evidenceIndependencePenaltyPro(res);
+  res.setupQuality=proClamp(Math.round((res.setupQuality||0)-penalty));
+  const killers=buildAdverseEvidencePro(res,regime);
+  pro.killers=killers;
+  pro.risk=professionalPositionRiskPro(res);
+  pro.execution=executionQualityPro(res,regime);
+  res.execution=res.execution||{};
+  pro.reasons=[];
+  if(regime.type.startsWith('TREND'))pro.reasons.push('رژیم روندی: اجازه به winnerها برای ادامه و تمرکز روی pullback/breakout معتبر');
+  if(regime.type==='RANGE')pro.reasons.push('رژیم رنج: breakout بدون confirmation ارزش کمتری دارد');
+  if(planCheck.valid)pro.reasons.push(`R:R حداقل ${planCheck.rr1}R و قابل قبول`); else if(planCheck.reason)pro.reasons.push(planCheck.reason);
+  if(res?.advancedStructure?.event)pro.reasons.push(`رویداد ساختار: ${res.advancedStructure.event}`);
+  if(res?.volumeMetrics?.ratio>=1.15)pro.reasons.push('حجم از میانگین برای تأیید حرکت حمایت می‌کند');
+  if(res?.mtfConfluence?.available&&!res.mtfConfluence.htfConflict)pro.reasons.push('هم‌راستایی تایم‌فریم‌های بالاتر');
+  if(killers.length)pro.reasons.push('قبل از ورود، شواهد مخالف باید دوباره بررسی شوند');
+  pro.executionPlan=[];
+  if(!planCheck.valid)pro.executionPlan.push('تا R:R معتبر و invalidation منطقی شکل نگرفته، ورود ممنوع');
+  if(chase)pro.executionPlan.push('تعقیب قیمت ممنوع؛ منتظر Retest/Pullback');
+  if(regime.type==='HIGH_VOL')pro.executionPlan.push('سایز کاهش یابد؛ SL بر مبنای ساختار و ATR باشد، نه عدد تصادفی');
+  pro.executionPlan.push('بعد از ورود، حد ضرر را علیه معامله عقب نبر و روی بازنده میانگین کم نکن');
+  pro.executionPlan.push(`Time-stop پیشنهادی: اگر طی ${PRO_TRADER_CFG.timeStopBars} کندل حرکت مورد انتظار شروع نشد، ستاپ را بازبینی کن`);
+  const heat=pro.risk.heat;
+  pro.risk.rr1=planCheck.rr1; pro.risk.rr2=planCheck.rr2; pro.risk.rr3=planCheck.rr3;
+  const entryOK=planCheck.valid && pro.execution.score>=PRO_TRADER_CFG.minExecution && heat<=PRO_TRADER_CFG.maxHeatPct;
+  // هرگز ستاپ را به‌خاطر لایهٔ حرفه‌ای به BUY تبدیل نکن؛ این لایه فقط می‌تواند ورود را محدود/کاهش دهد.
+  if((res.verdictClass==='v-buy'||res.verdictClass==='v-sell')&&!entryOK){
+    res.verdictClass='v-hold';
+    res.verdict='🟡 WAIT — ستاپ تحلیلی وجود دارد، اما فیلتر حرفه‌ای اجرا/ریسک ورود را رد کرد';
+    res.entryState='WAITING FOR EXECUTION FILTER';
+    res.risk=null;
+  }
+  if(killers.length>=3 && res.setupQuality<78){
+    res.verdictClass='v-hold'; res.verdict='⚪ NO TRADE — شواهد مخالف زیاد است'; res.risk=null; res.entryState='INVALIDATED / NO TRADE';
+  }
+  const confPenalty=penalty+(killers.length*2)+(pro.execution.score<70?8:0);
+  res.confidence=proClamp(Math.round((res.confidence||0)-confPenalty),5,95);
+  pro.action=res.verdict;
+  pro.tradeable=entryOK;
+  pro.independencePenalty=penalty;
+  return res;
+}
+
+const PRO_DERIV_CACHE=new Map();
+async function fetchJSONPro(url,timeout=5000){
+  const ctl=new AbortController(); const t=setTimeout(()=>ctl.abort(),timeout);
+  try{const r=await fetch(url,{signal:ctl.signal,cache:'no-store'}); if(!r.ok)throw new Error(`HTTP ${r.status}`); return await r.json();}
+  finally{clearTimeout(t);}
+}
+async function enrichCryptoDerivatives(res,symbol,interval='1h'){
+  if(!symbol||!/^[A-Z0-9]{5,20}$/.test(symbol))return res;
+  const key=`${symbol}_${interval}`; const now=Date.now(); const cached=PRO_DERIV_CACHE.get(key);
+  if(cached&&now-cached.t<30000){res.derivatives=cached.v; return applyDerivativeCrowding(res,cached.v);}
+  try{
+    const period=['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'].includes(interval)?interval:'1h';
+    const [fund,oi,book,taker]=await Promise.allSettled([
+      fetchJSONPro(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${encodeURIComponent(symbol)}`),
+      fetchJSONPro(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${encodeURIComponent(symbol)}`),
+      fetchJSONPro(`https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${encodeURIComponent(symbol)}`),
+      fetchJSONPro(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${encodeURIComponent(symbol)}&period=${period}&limit=1`)
+    ]);
+    const f=fund.status==='fulfilled'?fund.value:null, o=oi.status==='fulfilled'?oi.value:null, b=book.status==='fulfilled'?book.value:null, t=taker.status==='fulfilled'?(Array.isArray(taker.value)?taker.value[0]:taker.value):null;
+    const bid=proFinite(b?.bidPrice),ask=proFinite(b?.askPrice); const mid=bid&&ask?(bid+ask)/2:null; const spreadBps=mid?((ask-bid)/mid)*10000:null;
+    const v={status:(f||o||b)?'ok':'unavailable',fundingRate:proFinite(f?.lastFundingRate,0),nextFundingTime:proFinite(f?.nextFundingTime,null),markPrice:proFinite(f?.markPrice,null),openInterest:proFinite(o?.openInterest,null),spreadBps,book:{bid,ask},takerLongShort:proFinite(t?.buySellRatio,null)};
+    PRO_DERIV_CACHE.set(key,{t:now,v}); res.derivatives=v; return applyDerivativeCrowding(res,v);
+  }catch(e){res.derivatives={status:'unavailable',error:e.message}; return res;}
+}
+function applyDerivativeCrowding(res,d){
+  if(!d||d.status!=='ok')return res;
+  const fr=d.fundingRate||0, ts=d.takerLongShort;
+  let crowd=0, extreme=false, notes=[];
+  if(Math.abs(fr)>=0.0005){crowd+=Math.min(35,Math.abs(fr)*50000); extreme=Math.abs(fr)>=0.001; notes.push(fr>0?'Long crowding':'Short crowding');}
+  if(ts!=null&&ts>1.15){crowd+=15;notes.push('taker buy dominance');}
+  if(ts!=null&&ts<0.87){crowd+=15;notes.push('taker sell dominance');}
+  d.crowding={score:proClamp(Math.round(crowd)),extreme,notes};
+  // Funding/OI فقط crowding را توضیح می‌دهد؛ به‌تنهایی جهت معامله را عوض نمی‌کند.
+  if(extreme)res.setupQuality=proClamp((res.setupQuality||0)-4);
+  if(d.spreadBps!=null){res.execution=res.execution||{};res.execution.spreadBps=d.spreadBps;}
+  return res;
+}
+
+// بار اول بعد از لایه Pro Trader
 run();

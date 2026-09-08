@@ -142,6 +142,36 @@ async function fetchKlines(symbol, interval, limit=300){
   }));
 }
 
+// ---------- خلاصهٔ سریع روند برای هر تایم‌فریم (برای تحلیل چندتایم‌فریمی واقعی برای AI) ----------
+function quickTrendSnapshot(candles){
+  if(!candles || candles.length < 30) return { available:false };
+  const closes = candles.map(c=>c.close);
+  const ema20 = emaSeries(closes,20).at(-1);
+  const ema50 = emaSeries(closes, Math.min(50, closes.length-1)).at(-1);
+  const last = closes.at(-1);
+  const rsiVal = closes.length>=15 ? rsi(closes,14) : null;
+  const structure = marketStructure(candles);
+  let trend = 'رنج/نامشخص';
+  if(last > ema20 && ema20 > ema50) trend = 'صعودی';
+  else if(last < ema20 && ema20 < ema50) trend = 'نزولی';
+  return { available:true, trend, lastClose:last, ema20, ema50, rsi: rsiVal, structure: structure?.structure, bos: structure?.bos };
+}
+
+// تایم‌فریم‌های استاندارد برای تحلیل بالا-به-پایین (Top-Down) — ترتیب اهمیت: 1D → 4H → 1H → 15M → 5M
+const MTF_STACK = ['1d','4h','1h','15m','5m'];
+async function buildMultiTimeframeSnapshot(symbol){
+  const snapshot = {};
+  for(const tf of MTF_STACK){
+    try{
+      const candles = await fetchKlines(symbol, tf, 150);
+      snapshot[tf] = quickTrendSnapshot(candles);
+    }catch(e){
+      snapshot[tf] = { available:false };
+    }
+  }
+  return snapshot;
+}
+
 // ---------- ابزارهای ریاضی ----------
 function sma(arr, len){ return arr.slice(-len).reduce((a,b)=>a+b,0)/len; }
 function emaSeries(values, len){
@@ -315,6 +345,39 @@ function findOrderBlock(candles, atrVal){
   return null;
 }
 
+// ---------- Fair Value Gap (FVG) — شکاف قیمتی بین سه کندل متوالی ----------
+function findFVGs(candles, maxLookback=40){
+  const fvgs=[];
+  const start = Math.max(2, candles.length-maxLookback);
+  for(let i=start; i<candles.length; i++){
+    const c1 = candles[i-2], c3 = candles[i];
+    if(c1.high < c3.low) fvgs.push({ dir:'bull', top:c3.low, bottom:c1.high, index:i });
+    if(c1.low > c3.high) fvgs.push({ dir:'bear', top:c1.low, bottom:c3.high, index:i });
+  }
+  // فقط شکاف‌هایی که هنوز پر نشده‌اند (قیمت بعدی وارد محدوده نشده) را نگه دار
+  const lastClose = candles.at(-1).close;
+  return fvgs.filter(g => {
+    const mid = (g.top+g.bottom)/2;
+    return Math.abs(mid-lastClose)/lastClose*100 < 5; // فقط شکاف‌های نزدیک و مرتبط با قیمت فعلی
+  }).slice(-3);
+}
+
+// ---------- Liquidity: Equal Highs/Lows و Liquidity Sweep ساده ----------
+function findLiquidityPools(candles, lookback=60, tolerancePct=0.1){
+  const win = candles.slice(-lookback);
+  const { highs, lows } = findSwingPoints(win, 2);
+  const eqHighs = clusterLevels(highs, tolerancePct).filter(c=>c.strength>=2);
+  const eqLows = clusterLevels(lows, tolerancePct).filter(c=>c.strength>=2);
+  // Liquidity Sweep: کندل اخیر فیتیله‌ای بالاتر از Equal High زده ولی بسته نشده بالای آن (جمع‌آوری نقدینگی)
+  const last = candles.at(-1);
+  let sweep = null;
+  const nearestEqHigh = eqHighs[0]?.price;
+  const nearestEqLow = eqLows[0]?.price;
+  if(nearestEqHigh && last.high > nearestEqHigh && last.close < nearestEqHigh) sweep = 'Sweep بالای Equal High — احتمال جمع‌آوری نقدینگی خریداران و برگشت نزولی';
+  if(nearestEqLow && last.low < nearestEqLow && last.close > nearestEqLow) sweep = 'Sweep زیر Equal Low — احتمال جمع‌آوری نقدینگی فروشندگان و برگشت صعودی';
+  return { equalHighs: eqHighs.slice(0,2), equalLows: eqLows.slice(0,2), sweep };
+}
+
 // ---------- شناسایی نقاط سوینگ برای حمایت/مقاومت استاتیک ----------
 function findSwingPoints(candles, lookback=3){
   const highs=[], lows=[];
@@ -392,6 +455,8 @@ function analyze(candles, htfCandles){
   const vwapVal = vwap(candles.slice(-Math.min(candles.length,200)));
   const structure = marketStructure(candles);
   const orderBlock = findOrderBlock(candles, atrVal);
+  const fvgs = findFVGs(candles, 40);
+  const liquidity = findLiquidityPools(candles, 60, 0.1);
 
   // روند تایم‌فریم بالاتر (Multi-Timeframe Confirmation)
   let htfTrend = null;
@@ -517,8 +582,16 @@ function analyze(candles, htfCandles){
   }
   score += obScore;
 
+  // نقدینگی: Liquidity Sweep نزدیک Equal High/Low
+  let liqScore = 0;
+  if(liquidity?.sweep){
+    liqScore = liquidity.sweep.includes('صعودی') ? 1 : -1;
+    notes.push(liquidity.sweep);
+  }
+  score += liqScore;
+
   // --- محاسبه سطح اطمینان (Confidence) ---
-  const maxPossible = 18; // حداکثر تئوریک امتیاز با اسکیل‌های جدید
+  const maxPossible = 20; // حداکثر تئوریک امتیاز با اسکیل‌های جدید
   let confidence = Math.min(95, Math.round((Math.abs(score)/maxPossible)*100));
   if(adxVal.adx < 20) confidence = Math.round(confidence*0.7); // روند ضعیف = اطمینان کمتر
   if(htfTrend === 'mixed') confidence = Math.round(confidence*0.85);
@@ -562,9 +635,9 @@ function analyze(candles, htfCandles){
 
   return {
     lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
-    fib, vwapVal, structure, orderBlock,
+    fib, vwapVal, structure, orderBlock, fvgs, liquidity,
     resistances, supports, patterns, notes, score, verdict, verdictClass, confidence, risk,
-    trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore
+    trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore, liqScore
   };
 }
 
@@ -654,43 +727,63 @@ async function maybeCallAI(res, symbol, interval){
   }
   aiCard.style.display = 'block';
   const aiText = document.getElementById('aiText');
-  aiText.textContent = 'در حال دریافت روایت از هوش مصنوعی...';
+  aiText.textContent = 'در حال دریافت داده چند تایم‌فریمی (1D → 4H → 1H → 15M → 5M) و تحلیل...';
+
+  // تحلیل بالا-به-پایین واقعی: روند هر تایم‌فریم اصلی را جدا محاسبه و به AI می‌دهیم
+  const mtf = await buildMultiTimeframeSnapshot(symbol);
 
   const dataSummary = {
-    symbol, interval,
+    symbol, workingInterval: interval,
     lastClose: res.lastClose, ema20: res.ema20, ema50: res.ema50, ema200: res.ema200,
     rsi: res.rsiVal, macd: res.macdVal, atr: res.atrVal,
     bollinger: res.bb, stochastic: res.stoch, adx: res.adxVal, rsiDivergence: res.divergence,
     higherTimeframeTrend: res.htfTrend,
-    fibonacci: res.fib, vwap: res.vwapVal, marketStructure: res.structure, orderBlock: res.orderBlock,
+    multiTimeframeAnalysis: mtf, // روند/ساختار مستقل هر تایم‌فریم: 1d, 4h, 1h, 15m, 5m
+    fibonacci: res.fib, vwap: res.vwapVal, marketStructure: res.structure,
+    orderBlock: res.orderBlock, fairValueGaps: res.fvgs, liquidity: res.liquidity,
     resistances: res.resistances, supports: res.supports,
     patterns: res.patterns.map(p=>p.name),
     volumeNote: res.notes.find(n=>n.includes('حجم')),
     componentScores: {
       trend: res.trendScore, momentum: res.momScore, priceAction: res.paScore,
       volume: res.volScore, supportResistance: res.srScore, higherTimeframe: res.htfScore,
-      vwap: res.vwapScore, marketStructure: res.structureScore, fibonacci: res.fibScore, orderBlock: res.obScore
+      vwap: res.vwapScore, marketStructure: res.structureScore, fibonacci: res.fibScore,
+      orderBlock: res.obScore, liquiditySweep: res.liqScore
     },
     totalConfluenceScore: res.score,
     confidencePercent: res.confidence,
     ruleBasedVerdict: res.verdict,
-    suggestedRiskManagement: res.risk
+    suggestedRiskManagement: res.risk,
+    // داده‌هایی که این پلتفرم به آن‌ها دسترسی ندارد — AI موظف است برای همین موارد صراحتاً بگوید «داده در دسترس نیست»
+    notAvailable: ['Order Flow', 'Open Interest', 'Funding Rate', 'Long/Short Ratio', 'اخبار/رویدادهای فاندامنتال']
   };
 
-  const prompt = `تو یک تحلیل‌گر ارشد تکنیکال هستی که سبک کاری‌ات ترکیبی از روش‌های به‌کاررفته توسط برترین تریدرهای جهان است: خوانش ساختار بازار و پرایس‌اکشن به سبک الگوریتمی/ICT (روند، حمایت و مقاومت واقعی، عدم تعادل عرضه و تقاضا)، منطق حجم و تجمع/توزیع به سبک Wyckoff، و انضباط مدیریت ریسک به سبک تریدرهای حرفه‌ای صندوق‌های پوشش ریسک (هرگز بدون نسبت ریسک به ریوارد مشخص وارد معامله نشو).
+  aiText.textContent = 'در حال تحلیل توسط AI...';
 
-قوانین سخت‌گیرانه‌ای که باید دقیقاً رعایت کنی:
-1. فقط و فقط از داده‌های JSON زیر استفاده کن. این داده‌ها از محاسبات واقعی روی کندل‌های زنده نماد ${symbol} در تایم‌فریم ${interval} به‌دست آمده‌اند و شامل اندیکاتورهای کلاسیک (RSI, MACD, Bollinger, Stochastic, ADX)، سطوح فیبوناچی، VWAP، ساختار بازار (BOS/CHoCH به سبک Smart Money) و Order Block هستند — همه بر پایه تأیید تایم‌فریم بالاتر.
-2. هیچ عدد، قیمت، درصد یا رویداد خبری‌ای که در داده نیست اختراع نکن. اگر چیزی را نمی‌دانی، به‌جای حدس زدن بنویس "مشخص نیست".
-3. اگر componentScores در جهت‌های متضاد باشند (مثلاً روند صعودی ولی مومنتوم نزولی)، این تناقض را صریح توضیح بده؛ آن را نادیده نگیر یا ماستمالی نکن.
-4. اگر confidencePercent پایین است (کمتر از ۴۰) یا ruleBasedVerdict حاوی "HOLD" یا "داده کافی نیست" است، تحت هیچ شرایطی توصیه به BUY یا SELL قاطع نده — به‌جای آن روی سناریوهای شرطی و سطوح کلیدی برای رصد تمرکز کن.
-5. خروجی را دقیقاً با این ساختار به زبان فارسی روان بنویس:
-   - **جمع‌بندی ساختار بازار** (۲-۳ جمله)
-   - **نقاط قوت تحلیل** (نکاتی که سیگنال را تقویت می‌کنند)
-   - **نقاط ضعف / ریسک‌های تحلیل** (نکاتی که باید مراقبشان بود یا تناقض‌ها)
-   - **سناریوی معاملاتی** (فقط اگر ruleBasedVerdict قاطع و confidencePercent کافی باشد؛ نقطه ورود، حد ضرر، حد سود را از suggestedRiskManagement عیناً بازگو کن، عدد جدید نساز)
-   - **در یک جمله**: این یک سیگنال قابل‌اتکا است یا باید صبر کرد؟
-6. لحن حرفه‌ای، مختصر و بدون شعار تبلیغاتی. این توصیه مالی قطعی نیست، این را در پایان یادآوری کن.
+  const prompt = `تو یک Senior Crypto Market Analyst و Professional Technical Trader هستی.
+
+وظیفه‌ات تحلیل دقیق و چندلایه بازار ارز دیجیتال ${symbol} است، فقط و فقط بر اساس داده‌های JSON زیر که همگی از محاسبات واقعی روی کندل‌های زنده (Binance) به‌دست آمده‌اند — نه حدس، نه دانش عمومی قبلی، نه پیش‌بینی اخبار.
+
+## قوانین اصلی (اجباری)
+- هرگز صرفاً بر اساس یک اندیکاتور یا یک سیگنال نتیجه‌گیری نکن؛ ترکیب همه داده‌های زیر را در نظر بگیر: Market Structure، Price Action، Support/Resistance، Trend، Volume، Volatility، Liquidity، RSI، MACD، EMA، VWAP، Bollinger Bands، Fibonacci، Divergence، Candlestick Patterns، Fair Value Gap، Liquidity Sweep، Order Block.
+- فیلد notAvailable در داده مشخص می‌کند این موارد (Order Flow، Open Interest، Funding Rate، Long/Short Ratio، اخبار) در دسترس نیستند — برای این موارد صراحتاً بنویس «داده در دسترس نیست» و هرگز حدس نزن یا ادعای Whale Activity/Smart Money بدون داده واقعی نکن.
+- هیچ عدد، قیمت یا رویدادی که در JSON نیست اختراع نکن.
+
+## تحلیل چند تایم‌فریمی (اجباری)
+فیلد multiTimeframeAnalysis روند مستقل هر تایم‌فریم (1d, 4h, 1h, 15m, 5m) را می‌دهد. طبق ترتیب اهمیت 1D → 4H → 1H → 15M → 5M عمل کن: از تایم‌فریم‌های بالا روند اصلی، از تایم‌فریم‌های پایین‌تر (که workingInterval معمولاً بین آن‌هاست) نقطه ورود را استخراج کن. اگر تایم‌فریم پایین‌تر برخلاف تایم‌فریم بالاتر سیگنال داد، آن را سیگنال ضعیف‌تر در نظر بگیر و صریح اعلام کن.
+
+## ساختار خروجی (دقیقاً به این ترتیب و به فارسی روان بنویس)
+1. **Market Structure**: روند هر تایم‌فریم اصلی (از multiTimeframeAnalysis)، HH/HL یا LH/LL، آخرین BOS/CHoCH (از marketStructure)، و آیا شکست معتبر بوده یا احتمال Fake Breakout.
+2. **حمایت و مقاومت کلیدی**: فقط سطوح مهم (از resistances/supports)، با قیمت دقیق و قدرت هر سطح.
+3. **Price Action**: پترن‌های شناسایی‌شده (از patterns) را در Context ساختار بازار توضیح بده، نه فقط نام‌شان.
+4. **اندیکاتورها**: خلاصه RSI (شامل rsiDivergence)، MACD، EMA/SMA (شیب و Cross)، Bollinger (Squeeze/Expansion) — همه از داده واقعی.
+5. **Fibonacci**: سطوح کلیدی (fibonacci.levels) و هم‌پوشانی آن‌ها با S/R یا ساختار بازار.
+6. **Volume & Momentum**: از volumeNote و componentScores.
+7. **Liquidity & Smart Money**: از orderBlock، fairValueGaps، liquidity (Equal Highs/Lows، Sweep) — فقط با داده موجود، بدون ادعای بدون‌مبنا.
+8. **سناریوهای معاملاتی**: حداقل دو سناریو (LONG و SHORT) با Entry Zone، Trigger، Confirmation، Stop Loss، TP1، TP2، Risk/Reward — این اعداد را فقط از suggestedRiskManagement و سطوح S/R/Fibonacci واقعی بردار، عدد جدید نساز. اگر confidencePercent پایین (زیر ۴۰) یا ruleBasedVerdict نامشخص/HOLD است، سناریوها را به‌صورت شرطی ("اگر قیمت X را بشکند...") بنویس، نه توصیه قطعی.
+9. **جمع‌بندی نهایی**: یک جمله صریح — سیگنال معتبر و قابل‌اتکاست یا باید صبر کرد؟ و یادآوری کوتاه که این توصیه مالی قطعی نیست.
+
+لحن: حرفه‌ای، دقیق، بدون اغراق یا شعار تبلیغاتی.
 
 DATA:
 ${JSON.stringify(dataSummary)}`;
@@ -708,7 +801,7 @@ ${JSON.stringify(dataSummary)}`;
         },
         body: JSON.stringify({
           model:'claude-sonnet-4-6',
-          max_tokens: 1000,
+          max_tokens: 2200,
           messages:[{role:'user', content: prompt}]
         })
       });
@@ -720,6 +813,7 @@ ${JSON.stringify(dataSummary)}`;
         headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+settings.apiKey },
         body: JSON.stringify({
           model:'gpt-4o-mini',
+          max_tokens: 2200,
           messages:[{role:'user', content: prompt}]
         })
       });

@@ -43,8 +43,11 @@ loadSettings();
 
 // ---------- ویجت TradingView ----------
 let tvWidget = null;
+let chartReadyPromise = null;
 function renderTVWidget(symbol, interval){
   document.getElementById('chart_container').innerHTML = '';
+  let resolveReady;
+  chartReadyPromise = new Promise(r => resolveReady = r);
   tvWidget = new TradingView.widget({
     autosize: true,
     symbol: 'BINANCE:' + symbol,
@@ -57,8 +60,75 @@ function renderTVWidget(symbol, interval){
     enable_publishing: false,
     withdateranges: true,
     allow_symbol_change: true,
-    container_id: 'chart_container'
+    container_id: 'chart_container',
+    // اندیکاتورهای هم‌راستا با موتور تحلیل، مستقیم روی نمودار زنده
+    studies: [
+      { id: 'MAExp@tv-basicstudies', inputs: { length: 20 } },
+      { id: 'MAExp@tv-basicstudies', inputs: { length: 50 } },
+      { id: 'MAExp@tv-basicstudies', inputs: { length: 200 } },
+      { id: 'RSI@tv-basicstudies', inputs: { length: 14 } },
+      { id: 'MACD@tv-basicstudies' },
+      { id: 'BB@tv-basicstudies', inputs: { length: 20 } },
+      { id: 'VWAP@tv-basicstudies' }
+    ],
+    studies_overrides: {}
   });
+  try{
+    tvWidget.onChartReady(() => resolveReady());
+  }catch(e){ resolveReady(); }
+}
+
+// ---------- رسم تحلیل روی نمودار زنده (خطوط حمایت/مقاومت، فیبوناچی، ورود/حدضرر/حدسود) ----------
+async function drawAnalysisOnChart(res){
+  if(!tvWidget || !chartReadyPromise || res.insufficient) return;
+  try{
+    await chartReadyPromise;
+    const chart = tvWidget.activeChart();
+    // پاک‌کردن رسم‌های قبلی این سایت (اگر نمودار عوض شده باشد)
+    try{ chart.removeAllShapes(); }catch(e){}
+
+    const addHLine = (price, text, color, style='solid', width=1) => {
+      try{
+        chart.createShape({ time: Math.floor(Date.now()/1000), price }, {
+          shape: 'horizontal_line',
+          lock: true, disableSelection: true, disableSave: true,
+          overrides: {
+            linecolor: color, linewidth: width,
+            linestyle: style==='dashed' ? 2 : 0,
+            showLabel: true, textcolor: color, fontsize: 11,
+            horzLabelsAlign: 'right', text
+          }
+        });
+      }catch(e){}
+    };
+
+    // حمایت‌ها و مقاومت‌های استاتیک
+    res.resistances.forEach(r => addHLine(r.price, `مقاومت (قدرت ${r.strength})`, '#ef5350', 'dashed'));
+    res.supports.forEach(s => addHLine(s.price, `حمایت (قدرت ${s.strength})`, '#26a69a', 'dashed'));
+
+    // سطوح فیبوناچی روی آخرین لگ سوینگ
+    if(res.fib){
+      Object.entries(res.fib.levels).forEach(([k,v]) => {
+        addHLine(v, `Fib ${k}`, '#ffb800', 'dotted', 1);
+      });
+    }
+
+    // نقطه ورود / حد ضرر / حد سود (فقط وقتی سیگنال قاطع است)
+    if(res.risk){
+      addHLine(res.risk.entry, '🎯 ورود', '#4a90e2', 'solid', 2);
+      addHLine(res.risk.stopLoss, '🛑 حد ضرر', '#ef5350', 'solid', 2);
+      addHLine(res.risk.takeProfit1, '✅ حد سود ۱', '#26a69a', 'solid', 2);
+      addHLine(res.risk.takeProfit2, '✅ حد سود ۲', '#26a69a', 'solid', 1);
+    }
+
+    // بلاک سفارش (Order Block) در صورت شناسایی
+    if(res.orderBlock){
+      addHLine(res.orderBlock.high, `سقف Order Block (${res.orderBlock.dir==='bull'?'صعودی':'نزولی'})`, '#a78bfa', 'dashed');
+      addHLine(res.orderBlock.low, `کف Order Block`, '#a78bfa', 'dashed');
+    }
+  }catch(e){
+    console.warn('امکان رسم روی نمودار فراهم نشد:', e);
+  }
 }
 
 // ---------- دریافت داده خام از Binance ----------
@@ -175,6 +245,76 @@ function detectRSIDivergence(candles, closes){
   return { bullishDiv, bearishDiv };
 }
 
+// ---------- فیبوناچی روی آخرین لگ سوینگ قابل توجه ----------
+function fibonacci(candles, lookback=80){
+  const win = candles.slice(-lookback);
+  let hiIdx=0, loIdx=0;
+  win.forEach((c,i)=>{ if(c.high>win[hiIdx].high) hiIdx=i; if(c.low<win[loIdx].low) loIdx=i; });
+  const hi = win[hiIdx].high, lo = win[loIdx].low;
+  const impulseUp = hiIdx > loIdx; // آخرین حرکت مهم صعودی بوده یا نزولی
+  const diff = hi - lo;
+  const ratios = [0.236,0.382,0.5,0.618,0.786];
+  const levels = {};
+  ratios.forEach(r=>{
+    levels[r] = impulseUp ? hi - diff*r : lo + diff*r;
+  });
+  return { high:hi, low:lo, impulseUp, levels };
+}
+
+// ---------- VWAP (میانگین وزنی حجمی) روی بازهٔ دادهٔ دریافتی ----------
+function vwap(candles){
+  let cumPV=0, cumV=0;
+  const series = candles.map(c=>{
+    const typical = (c.high+c.low+c.close)/3;
+    cumPV += typical*c.volume; cumV += c.volume;
+    return cumV>0 ? cumPV/cumV : typical;
+  });
+  return series.at(-1);
+}
+
+// ---------- ساختار بازار: Break of Structure / Change of Character (سبک Smart Money) ----------
+function marketStructure(candles){
+  const { highs, lows } = findSwingPoints(candles, 3);
+  if(highs.length<2 || lows.length<2) return null;
+  const lastTwoHighs = highs.slice(-2);
+  const lastTwoLows = lows.slice(-2);
+  const higherHighs = lastTwoHighs[1] > lastTwoHighs[0];
+  const higherLows = lastTwoLows[1] > lastTwoLows[0];
+  let structure = 'رنج/نامشخص';
+  if(higherHighs && higherLows) structure = 'صعودی (HH+HL)';
+  else if(!higherHighs && !higherLows) structure = 'نزولی (LH+LL)';
+
+  const lastClose = candles.at(-1).close;
+  const prevSwingHigh = lastTwoHighs.at(-1);
+  const prevSwingLow = lastTwoLows.at(-1);
+  let bos = null; // Break of Structure
+  if(structure.startsWith('نزولی') && lastClose > prevSwingHigh) bos = 'CHoCH صعودی — تغییر احتمالی روند از نزولی به صعودی';
+  else if(structure.startsWith('صعودی') && lastClose < prevSwingLow) bos = 'CHoCH نزولی — تغییر احتمالی روند از صعودی به نزولی';
+  else if(structure.startsWith('صعودی') && lastClose > prevSwingHigh) bos = 'BOS صعودی — ادامه روند صعودی تأیید شد';
+  else if(structure.startsWith('نزولی') && lastClose < prevSwingLow) bos = 'BOS نزولی — ادامه روند نزولی تأیید شد';
+
+  return { structure, bos };
+}
+
+// ---------- شناسایی سادهٔ Order Block (آخرین کندل مخالف قبل از حرکت ایمپالسیو) ----------
+function findOrderBlock(candles, atrVal){
+  const n = candles.length;
+  for(let i=n-2; i>n-25 && i>2; i--){
+    const c = candles[i], next = candles[i+1];
+    const impulse = Math.abs(next.close-next.open) > atrVal*1.2;
+    if(!impulse) continue;
+    // بلاک سفارش صعودی: آخرین کندل نزولی قبل از یک کندل صعودی ایمپالسیو
+    if(c.close < c.open && next.close > next.open && next.close > c.high){
+      return { dir:'bull', high:c.high, low:c.low, index:i };
+    }
+    // بلاک سفارش نزولی: آخرین کندل صعودی قبل از یک کندل نزولی ایمپالسیو
+    if(c.close > c.open && next.close < next.open && next.close < c.low){
+      return { dir:'bear', high:c.high, low:c.low, index:i };
+    }
+  }
+  return null;
+}
+
 // ---------- شناسایی نقاط سوینگ برای حمایت/مقاومت استاتیک ----------
 function findSwingPoints(candles, lookback=3){
   const highs=[], lows=[];
@@ -248,6 +388,10 @@ function analyze(candles, htfCandles){
   const stoch = stochastic(candles,14,3);
   const adxVal = adx(candles,14);
   const divergence = detectRSIDivergence(candles, closes);
+  const fib = fibonacci(candles, 80);
+  const vwapVal = vwap(candles.slice(-Math.min(candles.length,200)));
+  const structure = marketStructure(candles);
+  const orderBlock = findOrderBlock(candles, atrVal);
 
   // روند تایم‌فریم بالاتر (Multi-Timeframe Confirmation)
   let htfTrend = null;
@@ -335,8 +479,46 @@ function analyze(candles, htfCandles){
   else if(htfTrend === 'mixed'){ notes.push('روند تایم‌فریم بالاتر مختلط/نامشخص است — احتیاط بیشتر'); }
   score += htfScore;
 
+  // VWAP — سطح مرجع نهادی
+  let vwapScore = 0;
+  if(lastClose > vwapVal){ vwapScore = 1; notes.push(`قیمت بالای VWAP (${vwapVal.toFixed(4)}) — تمایل خریداران نهادی`); }
+  else { vwapScore = -1; notes.push(`قیمت زیر VWAP (${vwapVal.toFixed(4)}) — تمایل فروشندگان نهادی`); }
+  score += vwapScore;
+
+  // ساختار بازار (Smart Money: BOS / CHoCH)
+  let structureScore = 0;
+  if(structure?.bos){
+    if(structure.bos.includes('صعودی')){ structureScore = structure.bos.startsWith('CHoCH')?1:2; notes.push(structure.bos); }
+    else { structureScore = structure.bos.startsWith('CHoCH')?-1:-2; notes.push(structure.bos); }
+  } else if(structure){ notes.push(`ساختار بازار: ${structure.structure}`); }
+  score += structureScore;
+
+  // نزدیکی به فیبوناچی (سطح ۰.۵ / ۰.۶۱۸ به‌عنوان ناحیه طلایی)
+  let fibScore = 0;
+  if(fib){
+    const golden = [fib.levels[0.5], fib.levels[0.618]];
+    const near = golden.find(lv => Math.abs(lv-lastClose)/lastClose*100 < 0.4);
+    if(near){
+      fibScore = fib.impulseUp ? 1 : -1;
+      notes.push(`قیمت در ناحیه طلایی فیبوناچی (۰.۵-۰.۶۱۸) نسبت به آخرین لگ قیمتی قرار دارد`);
+    }
+  }
+  score += fibScore;
+
+  // نزدیکی به Order Block
+  let obScore = 0;
+  if(orderBlock){
+    const inZone = lastClose >= orderBlock.low && lastClose <= orderBlock.high;
+    const nearZone = Math.abs(((orderBlock.high+orderBlock.low)/2)-lastClose)/lastClose*100 < 0.6;
+    if(inZone || nearZone){
+      obScore = orderBlock.dir==='bull' ? 1 : -1;
+      notes.push(`قیمت در محدوده Order Block ${orderBlock.dir==='bull'?'صعودی (حمایتی)':'نزولی (مقاومتی)'} قرار دارد`);
+    }
+  }
+  score += obScore;
+
   // --- محاسبه سطح اطمینان (Confidence) ---
-  const maxPossible = 12; // حداکثر تئوریک امتیاز
+  const maxPossible = 18; // حداکثر تئوریک امتیاز با اسکیل‌های جدید
   let confidence = Math.min(95, Math.round((Math.abs(score)/maxPossible)*100));
   if(adxVal.adx < 20) confidence = Math.round(confidence*0.7); // روند ضعیف = اطمینان کمتر
   if(htfTrend === 'mixed') confidence = Math.round(confidence*0.85);
@@ -350,13 +532,13 @@ function analyze(candles, htfCandles){
     verdict = 'داده کافی/باکیفیت نیست — بدون سیگنال'; verdictClass='v-none';
   } else if(htfConflict && Math.abs(score) < 5){
     verdict = 'HOLD — تناقض بین تایم‌فریم فعلی و تایم‌فریم بالاتر، ورود توصیه نمی‌شود'; verdictClass='v-hold';
-  } else if(score >= 5){
+  } else if(score >= 6){
     verdict = 'BUY (خرید) — همگرایی قوی سیگنال‌های صعودی'; verdictClass='v-buy';
-  } else if(score <= -5){
+  } else if(score <= -6){
     verdict = 'SELL (فروش) — همگرایی قوی سیگنال‌های نزولی'; verdictClass='v-sell';
-  } else if(score >= 2){
+  } else if(score >= 3){
     verdict = 'تمایل به BUY، اما با احتیاط — سیگنال‌ها هم‌جهت اما ضعیف'; verdictClass='v-hold';
-  } else if(score <= -2){
+  } else if(score <= -3){
     verdict = 'تمایل به SELL، اما با احتیاط — سیگنال‌ها هم‌جهت اما ضعیف'; verdictClass='v-hold';
   } else {
     verdict = 'HOLD — عدم قطعیت / سیگنال‌های متضاد، وارد پوزیشن نشوید'; verdictClass='v-hold';
@@ -380,8 +562,9 @@ function analyze(candles, htfCandles){
 
   return {
     lastClose, ema20, ema50, ema200, rsiVal, macdVal, atrVal, bb, stoch, adxVal, divergence, htfTrend,
+    fib, vwapVal, structure, orderBlock,
     resistances, supports, patterns, notes, score, verdict, verdictClass, confidence, risk,
-    trendScore, momScore, paScore, volScore, srScore, htfScore
+    trendScore, momScore, paScore, volScore, srScore, htfScore, vwapScore, structureScore, fibScore, obScore
   };
 }
 
@@ -408,6 +591,10 @@ function renderResult(res, symbol, interval){
   document.getElementById('s_pa').innerHTML = label(res.paScore);
   document.getElementById('s_vol').innerHTML = label(res.volScore);
   document.getElementById('s_sr').innerHTML = label(res.srScore);
+  document.getElementById('s_vwap').innerHTML = label(res.vwapScore);
+  document.getElementById('s_struct').innerHTML = label(res.structureScore) + (res.structure? ` <span class="muted">(${res.structure.structure})</span>` : '');
+  document.getElementById('s_fib').innerHTML = label(res.fibScore);
+  document.getElementById('s_ob').innerHTML = label(res.obScore);
   const htfRow = document.getElementById('s_htf_row');
   if(htfRow){
     htfRow.style.display = res.htfTrend ? 'flex' : 'none';
@@ -453,6 +640,7 @@ function renderResult(res, symbol, interval){
   document.getElementById('reasonCard').style.display='block';
   document.getElementById('reasonText').innerHTML = '<ul>' + res.notes.map(n=>`<li>${n}</li>`).join('') + '</ul>';
 
+  drawAnalysisOnChart(res);
   maybeCallAI(res, symbol, interval);
 }
 
@@ -474,12 +662,14 @@ async function maybeCallAI(res, symbol, interval){
     rsi: res.rsiVal, macd: res.macdVal, atr: res.atrVal,
     bollinger: res.bb, stochastic: res.stoch, adx: res.adxVal, rsiDivergence: res.divergence,
     higherTimeframeTrend: res.htfTrend,
+    fibonacci: res.fib, vwap: res.vwapVal, marketStructure: res.structure, orderBlock: res.orderBlock,
     resistances: res.resistances, supports: res.supports,
     patterns: res.patterns.map(p=>p.name),
     volumeNote: res.notes.find(n=>n.includes('حجم')),
     componentScores: {
       trend: res.trendScore, momentum: res.momScore, priceAction: res.paScore,
-      volume: res.volScore, supportResistance: res.srScore, higherTimeframe: res.htfScore
+      volume: res.volScore, supportResistance: res.srScore, higherTimeframe: res.htfScore,
+      vwap: res.vwapScore, marketStructure: res.structureScore, fibonacci: res.fibScore, orderBlock: res.obScore
     },
     totalConfluenceScore: res.score,
     confidencePercent: res.confidence,
@@ -490,7 +680,7 @@ async function maybeCallAI(res, symbol, interval){
   const prompt = `تو یک تحلیل‌گر ارشد تکنیکال هستی که سبک کاری‌ات ترکیبی از روش‌های به‌کاررفته توسط برترین تریدرهای جهان است: خوانش ساختار بازار و پرایس‌اکشن به سبک الگوریتمی/ICT (روند، حمایت و مقاومت واقعی، عدم تعادل عرضه و تقاضا)، منطق حجم و تجمع/توزیع به سبک Wyckoff، و انضباط مدیریت ریسک به سبک تریدرهای حرفه‌ای صندوق‌های پوشش ریسک (هرگز بدون نسبت ریسک به ریوارد مشخص وارد معامله نشو).
 
 قوانین سخت‌گیرانه‌ای که باید دقیقاً رعایت کنی:
-1. فقط و فقط از داده‌های JSON زیر استفاده کن. این داده‌ها از محاسبات واقعی روی کندل‌های زنده نماد ${symbol} در تایم‌فریم ${interval} (به همراه تأیید تایم‌فریم بالاتر) به‌دست آمده‌اند.
+1. فقط و فقط از داده‌های JSON زیر استفاده کن. این داده‌ها از محاسبات واقعی روی کندل‌های زنده نماد ${symbol} در تایم‌فریم ${interval} به‌دست آمده‌اند و شامل اندیکاتورهای کلاسیک (RSI, MACD, Bollinger, Stochastic, ADX)، سطوح فیبوناچی، VWAP، ساختار بازار (BOS/CHoCH به سبک Smart Money) و Order Block هستند — همه بر پایه تأیید تایم‌فریم بالاتر.
 2. هیچ عدد، قیمت، درصد یا رویداد خبری‌ای که در داده نیست اختراع نکن. اگر چیزی را نمی‌دانی، به‌جای حدس زدن بنویس "مشخص نیست".
 3. اگر componentScores در جهت‌های متضاد باشند (مثلاً روند صعودی ولی مومنتوم نزولی)، این تناقض را صریح توضیح بده؛ آن را نادیده نگیر یا ماستمالی نکن.
 4. اگر confidencePercent پایین است (کمتر از ۴۰) یا ruleBasedVerdict حاوی "HOLD" یا "داده کافی نیست" است، تحت هیچ شرایطی توصیه به BUY یا SELL قاطع نده — به‌جای آن روی سناریوهای شرطی و سطوح کلیدی برای رصد تمرکز کن.

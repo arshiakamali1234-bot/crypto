@@ -641,6 +641,56 @@ function detectPatterns(candles){
   return patterns;
 }
 
+
+// =========================================================
+// V7 — Candlestick Context Engine
+// کندل «پیش‌گویی قطعی» نمی‌کند؛ فقط فشار احتمالی موج بعدی را از شکل کندل
+// در محل Pivot/SR و با حجم/ساختار اندازه‌گیری می‌کند.
+// =========================================================
+function candleMetricsV7(c){
+  const range=Math.max(c.high-c.low,0), body=Math.abs(c.close-c.open);
+  const upper=c.high-Math.max(c.open,c.close), lower=Math.min(c.open,c.close)-c.low;
+  return {range,body,upper,lower,bodyPct:range?body/range:0,closePos:range?(c.close-c.low)/range:.5,
+    bullish:c.close>c.open,bearish:c.close<c.open};
+}
+function detectCandlestickContextV7(candles,supports=[],resistances=[],atrVal=null){
+  if(!candles || candles.length<5) return null;
+  const n=candles.length,c0=candles[n-1],c1=candles[n-2],c2=candles[n-3];
+  const m=candleMetricsV7(c0),p=candleMetricsV7(c1);
+  const avgBody=candles.slice(-21,-1).reduce((s,c)=>s+candleMetricsV7(c).body,0)/20;
+  const bodyRef=Math.max(avgBody,(atrVal||0)*.05,1e-12);
+  const tol=Math.max((atrVal||0)*.35,c0.close*.002);
+  const near=(levels)=>levels.find(x=>Math.abs((x.price??x)-c0.close)<=tol);
+  const ns=near(supports),nr=near(resistances),patterns=[];
+  const add=(name,dir,strength)=>patterns.push({name,dir,strength});
+  if(m.range>0 && m.bodyPct<=.1) add('Doji','neutral',40);
+  if(m.lower>=m.body*2 && m.upper<=Math.max(m.body,m.range*.12)) add('Hammer / Bullish Pin Bar','up',70);
+  if(m.upper>=m.body*2 && m.lower<=Math.max(m.body,m.range*.12)) add('Shooting Star / Bearish Pin Bar','down',70);
+  if(c0.close>c0.open && c1.close<c1.open && c0.open<=c1.close && c0.close>=c1.open) add('Bullish Engulfing','up',80);
+  if(c0.close<c0.open && c1.close>c1.open && c0.open>=c1.close && c0.close<=c1.open) add('Bearish Engulfing','down',80);
+  if(m.body>bodyRef*1.8 && m.closePos>=.85) add('Bullish Marubozu-like','up',65);
+  if(m.body>bodyRef*1.8 && m.closePos<=.15) add('Bearish Marubozu-like','down',65);
+  if(c0.high<=c1.high && c0.low>=c1.low) add('Inside Bar','neutral',55);
+  if(c0.high>c1.high && c0.low<c1.low) add('Outside Bar',m.bullish?'up':m.bearish?'down':'neutral',60);
+  if(c2 && candleMetricsV7(c2).bearish && p.body<=candleMetricsV7(c2).body*.6 && m.bullish && c0.close>(c2.open+c2.close)/2) add('Morning Star-like','up',75);
+  if(c2 && candleMetricsV7(c2).bullish && p.body<=candleMetricsV7(c2).body*.6 && m.bearish && c0.close<(c2.open+c2.close)/2) add('Evening Star-like','down',75);
+  let bull=0,bear=0;
+  patterns.forEach(x=>x.dir==='up'?bull+=x.strength:x.dir==='down'?bear+=x.strength:0);
+  if(ns){bull+=20;if(m.lower>m.body)bull+=10;}
+  if(nr){bear+=20;if(m.upper>m.body)bear+=10;}
+  const volAvg=candles.slice(-21,-1).reduce((s,c)=>s+(c.volume||0),0)/20;
+  const volumeRatio=volAvg>0?(c0.volume||0)/volAvg:null;
+  if(volumeRatio!=null && volumeRatio>=1.5){if(m.bullish)bull+=10;if(m.bearish)bear+=10;}
+  bull=Math.min(100,Math.round(bull));bear=Math.min(100,Math.round(bear));
+  const direction=bull-bear>=15?'up':bear-bull>=15?'down':'neutral';
+  const nextWaveBias=direction==='up'?'احتمال تقویت موج صعودی':direction==='down'?'احتمال تقویت موج نزولی':'جهت موج بعدی تأیید نشده';
+  const trigger=direction==='up'&&nr?`بسته‌شدن بالای مقاومت ${nr.price??nr}`:direction==='down'&&ns?`بسته‌شدن زیر حمایت ${ns.price??ns}`:'شکست Pivot بعدی + حجم';
+  return {patterns,bullishPressure:bull,bearishPressure:bear,direction,nextWaveBias,trigger,
+    nearSupport:ns||null,nearResistance:nr||null,volumeRatio:volumeRatio==null?null:+volumeRatio.toFixed(2),
+    lastCandle:{open:c0.open,high:c0.high,low:c0.low,close:c0.close},
+    evidence:'شکل کندل + محل نسبت به Pivot/SR + حجم؛ الگوی کندلی به‌تنهایی پیش‌بینی قطعی نیست.'};
+}
+
 // ---------- امتیازدهی و نتیجه‌گیری نهایی ----------
 /* =========================================================
    ANALYSIS ENGINE V2 — ساختارمحور، چندتایم‌فریمی، ضد نویز
@@ -898,6 +948,7 @@ function analyze(candles, htfCandles, mtfSnapshot=null){
   const {highs,lows}=findSwingPoints(candles,3);
   const resistances=clusterLevels(highs.filter(x=>x>lastClose),0.15).sort((a,b)=>a.price-b.price).slice(0,4);
   const supports=clusterLevels(lows.filter(x=>x<lastClose),0.15).sort((a,b)=>b.price-a.price).slice(0,4);
+  const candleContext=detectCandlestickContextV7(candles,supports,resistances,atrVal);
   const htfTrend=htfCandles&&htfCandles.length>=80 ? deriveTrendState(htfCandles).trend : null;
   const mtf=mtfConfluence(mtfSnapshot);
   const nearestRes=resistances[0]?.price, nearestSup=supports[0]?.price;
@@ -969,7 +1020,7 @@ function analyze(candles, htfCandles, mtfSnapshot=null){
   const confidence=clamp(Math.round(setupQuality*(readiness/100)),5,95);
   return {
     lastClose,ema20,ema50,ema200,rsiVal,macdVal,atrVal,bb,stoch,adxVal,divergence,htfTrend,fib,vwapVal,structure:legacyStructure||structure,
-    advancedStructure:structure,ichimoku:ich,mtfConfluence:mtf,orderBlock,fvgs,liquidity,volumeMetrics:volume,volumeProfile:vp,resistances,supports,patterns,chartPattern,classicalPatterns,waveEngine,
+    advancedStructure:structure,ichimoku:ich,mtfConfluence:mtf,orderBlock,fvgs,liquidity,volumeMetrics:volume,volumeProfile:vp,resistances,supports,patterns,chartPattern,classicalPatterns,waveEngine,candleContext,
     recentSwingHighs:highs.slice(-8),recentSwingLows:lows.slice(-8),notes,
     score:directional,setupQuality,entryReadiness:readiness,confidence,verdict,verdictClass,risk,watchLong,watchShort,
     entryState:verdictClass==='v-buy'||verdictClass==='v-sell'?'ENTRY VALID':longReadiness>=70||shortReadiness>=70?'TRIGGER FORMED':'NO SETUP',
@@ -1036,7 +1087,7 @@ function renderResult(res, symbol, interval, lastClosedTime){
   if(res.insufficient){
     els.verdictBox.className = 'verdict v-none';
     els.verdictBox.textContent = 'داده کافی برای تحلیل معتبر وجود ندارد (حداقل ۶۰ کندل لازم است). به‌جای حدس زدن، تحلیلی ارائه نمی‌شود.';
-    ['qualityCard','scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard'].forEach(id=>document.getElementById(id).style.display='none');
+    ['qualityCard','scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard','trustCard'].forEach(id=>document.getElementById(id).style.display='none');
     const stalePro=document.getElementById('proTraderCard'); if(stalePro) stalePro.remove();
     return;
   }
@@ -1086,6 +1137,16 @@ function renderResult(res, symbol, interval, lastClosedTime){
     ${pro.executionPlan?.length?`<div class="pro-block"><b>قوانین اجرا:</b> ${pro.executionPlan.map(escapeHTML).join(' • ')}</div>`:''}
   `;
   qualityCard?.insertAdjacentElement('afterend',proCard);
+  const oldTrust=document.getElementById('trustCard'); if(oldTrust) oldTrust.remove();
+  const tr=res.trust||{};
+  const trustCard=document.createElement('div'); trustCard.id='trustCard'; trustCard.className='card trust-card';
+  const tClass=tr.status==='TRADE_READY'?'trust-ok':tr.status==='PAPER_ONLY'?'trust-warn':'trust-block';
+  trustCard.innerHTML=`<h3>🛡️ دروازهٔ اعتماد و اعتبارسنجی</h3>
+    <div class="trust-status ${tClass}"><span>${escapeHTML(tr.label||'نامشخص')}</span><b>${tr.score??'—'}/100</b></div>
+    <div class="trust-checks">${(tr.data?.checks||[]).map(c=>`<div><span>${c.ok?'✓':'✕'}</span>${escapeHTML(c.label)}</div>`).join('')}</div>
+    <div class="trust-note">${tr.validation?.validated?'بک‌تست و Walk-Forward تأیید شده است.':'این امتیاز «احتمال برد» نیست. تا ثبت حداقل ۱۰۰ معاملهٔ خارج‌ازنمونه و Walk-Forward، خروجی فقط برای Paper Trading قابل اتکاتر است.'}</div>
+    ${tr.reasons?.length?`<div class="muted">${tr.reasons.map(escapeHTML).join(' • ')}</div>`:''}`;
+  proCard.insertAdjacentElement('afterend',trustCard);
 
   document.getElementById('scoreCard').style.display='block';
   document.getElementById('s_trend').innerHTML = label(res.trendScore);
@@ -1206,6 +1267,22 @@ function renderResult(res, symbol, interval, lastClosedTime){
   } else {
     waveCard.style.display='none';
   }
+
+  const candleCard=document.getElementById('candleCard');
+  if(candleCard && res.candleContext){
+    candleCard.style.display='block';
+    const cc=res.candleContext;
+    let ch=`<div class="row"><span>الگوهای کندلی</span><span>${cc.patterns.length?cc.patterns.map(x=>x.name).join('، '):'هیچ الگوی معتبر'}</span></div>`;
+    ch+=`<div class="row"><span>فشار کندلی صعودی</span><span>${cc.bullishPressure}/100</span></div>`;
+    ch+=`<div class="row"><span>فشار کندلی نزولی</span><span>${cc.bearishPressure}/100</span></div>`;
+    ch+=`<div class="row"><span>اثر روی موج بعدی</span><span>${cc.nextWaveBias}</span></div>`;
+    if(cc.nearSupport) ch+=`<div class="row"><span>نزدیک حمایت Pivot-based</span><span>${cc.nearSupport.price??cc.nearSupport}</span></div>`;
+    if(cc.nearResistance) ch+=`<div class="row"><span>نزدیک مقاومت Pivot-based</span><span>${cc.nearResistance.price??cc.nearResistance}</span></div>`;
+    if(cc.volumeRatio!=null) ch+=`<div class="row"><span>نسبت حجم آخرین کندل به میانگین</span><span>${cc.volumeRatio}x</span></div>`;
+    ch+=`<p class="muted" style="margin-top:8px">Trigger: ${cc.trigger}</p>`;
+    ch+=`<p class="muted">${cc.evidence}</p>`;
+    document.getElementById('candleContent').innerHTML=ch;
+  } else if(candleCard) candleCard.style.display='none';
 
   document.getElementById('reasonCard').style.display='block';
   document.getElementById('reasonText').innerHTML = '<ul>' + res.notes.map(n=>`<li>${n}</li>`).join('') + '</ul>';
@@ -1455,6 +1532,7 @@ async function deepAnalyzeSymbol(symbol, workingTf='1h', htfTf='4h'){
     if(res.insufficient)return null;
     res=await enrichCryptoDerivatives(res,symbol,workingTf);
     res=applyProTraderLayer(res,candles,symbol,workingTf);
+    res=applyTrustGate(res,candles,symbol,workingTf);
     return {symbol,workingTf,...res};
   }catch(e){return null;}
 }
@@ -1546,6 +1624,29 @@ window.addEventListener('unhandledrejection', e=>{
   console.error('Unhandled promise rejection:', e.reason);
 });
 
+function renderQuantV8(res){
+  const card=document.getElementById('quantCard'); if(!card||!res||res.insufficient)return;
+  card.style.display='block';
+  const v=res.volatilityContext||{},b=res.breakoutQuality||{},u=res.uncertainty||{},e=res.executionCost||{},r=res.quantRisk||{};
+  document.getElementById('q_regime').textContent=`${v.trend||'—'} / ${v.volatility||'—'}`;
+  document.getElementById('q_vol').textContent=`${v.atrPct??'—'}% | ADX ${v.adx??'—'}`;
+  document.getElementById('q_breakout').textContent=`Bull ${b.bullish??'—'} / Bear ${b.bearish??'—'}`;
+  document.getElementById('q_fakeout').textContent=`${b.fakeoutRisk??'—'}/100`;
+  document.getElementById('q_uncertainty').textContent=`${u.score??'—'}/100 (agreement ${u.agreement??'—'}%)`;
+  document.getElementById('q_cost').textContent=`${e.estimatedRoundTripBps??'—'} bps`;
+  document.getElementById('q_risk').textContent=`${r.recommendedRiskPct??'—'}%`;
+}
+async function runResearchV8(){
+  const symbol=els.symbol.value.trim().toUpperCase(); const interval=els.interval.value;
+  const card=document.getElementById('researchCard'),out=document.getElementById('researchContent'); if(card)card.style.display='block';
+  if(out)out.textContent='در حال دریافت تاریخچه برای Research Backtest...';
+  try{
+    const c=await fetchKlines(symbol,interval,1000,true);
+    const bt=quickBacktestV8(c,800),wf=runWalkForwardDiagnosticsV8(c);
+    if(out){out.innerHTML=bt.ok?`<div class="row"><span>Trades</span><span>${bt.trades}</span></div><div class="row"><span>Win Rate</span><span>${bt.winRate.toFixed(1)}%</span></div><div class="row"><span>Profit Factor</span><span>${bt.profitFactor==null?'—':bt.profitFactor.toFixed(2)}</span></div><div class="row"><span>Expectancy</span><span>${(bt.expectancy*100).toFixed(3)}%</span></div><div class="row"><span>Max Drawdown</span><span>${bt.maxDrawdown.toFixed(2)}%</span></div><div class="row"><span>Walk-Forward</span><span>${wf.ok?(wf.passed?'PASS (diagnostic)':'FAIL / insufficient robustness'):'Unavailable'}</span></div><div class="muted" style="margin-top:8px">${escapeHTML(bt.warning||wf.note||'')}</div>`:'تست اجرا نشد: '+escapeHTML(bt.reason||'داده کافی نیست');}
+  }catch(err){if(out)out.textContent='خطا در Research Lab: '+err.message;}
+}
+
 // ---------- اجرای اصلی ----------
 async function run(){
   const symbol = els.symbol.value.trim().toUpperCase();
@@ -1567,7 +1668,10 @@ async function run(){
     if(!res.insufficient){
       res = await enrichCryptoDerivatives(res, symbol, interval);
       res = applyProTraderLayer(res, candles, symbol, interval);
+      res = applyAdvancedQuantLayer(res, candles, symbol);
+      res = applyTrustGate(res, candles, symbol, interval);
     }
+    renderQuantV8(res);
     renderResult(res, symbol, interval, candles.at(-1)?.closeTime);
   }catch(e){
     els.verdictBox.className='verdict v-none';
@@ -1584,6 +1688,221 @@ fetch('https://api.binance.com/api/v3/exchangeInfo').then(r=>r.json()).then(d=>{
   });
 }).catch(()=>{});
 
+
+
+/* =========================================================
+   V8 QUANT / MARKET CONTEXT LAYER
+   اضافه‌شده بر اساس اصول سیستم‌های systematic/pro trading:
+   - Regime detection و volatility state
+   - Market breadth + BTC-relative strength
+   - Breakout quality / fakeout risk
+   - Execution-cost realism (spread/fee/slippage)
+   - Uncertainty / evidence agreement
+   - Risk-aware sizing overlay
+   - Research backtest + walk-forward diagnostics (بدون unlock کردن Trade Ready)
+   ========================================================= */
+const V8_CFG={
+  feeBps:4,
+  baseSlippageBps:2,
+  maxRiskPct:2,
+  maxVolPct:8,
+  maxCorrelation:0.85,
+  breadthCacheMs:60000,
+  contextCacheMs:60000
+};
+const V8_CACHE=new Map();
+function meanV8(a){const x=a.filter(Number.isFinite);return x.length?x.reduce((s,v)=>s+v,0)/x.length:null;}
+function stdevV8(a){const m=meanV8(a);if(m==null)return null;return Math.sqrt(meanV8(a.map(x=>(x-m)**2))||0);}
+function percentileV8(a,p){const x=a.filter(Number.isFinite).sort((u,v)=>u-v);if(!x.length)return null;const i=(x.length-1)*p,k=Math.floor(i),d=i-k;return x[k]+(x[k+1]-x[k])*(d||0);}
+function returnsV8(c){const out=[];for(let i=1;i<c.length;i++)out.push(c[i-1].close?c[i].close/c[i-1].close-1:0);return out;}
+function correlationV8(a,b){const n=Math.min(a.length,b.length);if(n<20)return null;const x=a.slice(-n),y=b.slice(-n),mx=meanV8(x),my=meanV8(y);let num=0,dx=0,dy=0;for(let i=0;i<n;i++){const xx=x[i]-mx,yy=y[i]-my;num+=xx*yy;dx+=xx*xx;dy+=yy*yy;}return dx&&dy?num/Math.sqrt(dx*dy):null;}
+function volatilityRegimeV8(c){
+  if(!c||c.length<60)return {available:false};
+  const closes=c.map(x=>x.close), A=atr(c,14)||0, last=closes.at(-1);
+  const atrPct=last?A/last*100:0;
+  const atrSeries=[]; for(let i=30;i<c.length;i++){const a=atr(c.slice(0,i+1),14);if(a&&closes[i])atrSeries.push(a/closes[i]*100);}
+  const p25=percentileV8(atrSeries,.25)||atrPct,p75=percentileV8(atrSeries,.75)||atrPct;
+  const ad=adx(c,14)?.adx||0;
+  const bb=bollinger(closes,20,2);
+  const width=bb&&bb.mid?((bb.upper-bb.lower)/bb.mid*100):0;
+  let regime='NORMAL'; if(atrPct>=p75*1.15||atrPct>8)regime='HIGH_VOL'; else if(atrPct<=p25*.85)regime='LOW_VOL';
+  const trend=ad>=25?'TRENDING':ad<=18?'RANGING':'TRANSITION';
+  return {available:true,atrPct:+atrPct.toFixed(3),atrPercentile25:+p25.toFixed(3),atrPercentile75:+p75.toFixed(3),bbWidthPct:+width.toFixed(3),adx:+ad.toFixed(2),volatility:regime,trend,regimeKey:`${trend}_${regime}`};
+}
+function breakoutQualityV8(c,pattern,vol){
+  if(!c||c.length<30)return {available:false};
+  const last=c.at(-1),prev=c.at(-2),A=atr(c,14)||0,vr=vol?.ratio||1;
+  let up=0,down=0,reasons=[];
+  const body=Math.abs(last.close-last.open),range=Math.max(1e-12,last.high-last.low);
+  const closePos=(last.close-last.low)/range;
+  if(pattern?.breakout==='up'){up+=35; reasons.push('قیمت بالای مرز الگو');}
+  if(pattern?.breakout==='down'){down+=35; reasons.push('قیمت زیر مرز الگو');}
+  if(A&&body>A*.55){if(last.close>last.open)up+=20;else down+=20;reasons.push('displacement مناسب');}
+  if(vr>=1.3){if(last.close>last.open)up+=20;else down+=20;reasons.push('حجم تأییدی');}
+  if(last.close>last.open&&closePos>.7)up+=10; if(last.close<last.open&&closePos<.3)down+=10;
+  const fakeoutRisk=Math.max(0,Math.min(100,Math.round(100-Math.max(up,down)+(vr<.9?12:0)+(body<A*.3?15:0))));
+  return {available:true,bullish:Math.min(100,up),bearish:Math.min(100,down),fakeoutRisk,reasons};
+}
+function evidenceUncertaintyV8(res){
+  const parts=[];
+  const vals=[res?.structure?.structure,res?.htfTrend,res?.mtfConfluence?.score,res?.waveEngine?.overall,res?.candleContext?.nextWaveBias,res?.volatilityContext?.trend];
+  if(vals.filter(v=>v!=null).length<4)parts.push('شواهد کافی برای اجماع کامل وجود ندارد');
+  const dirs=[]; if((res?.score||0)>8)dirs.push('LONG'); if((res?.score||0)<-8)dirs.push('SHORT');
+  if(res?.htfTrend==='up')dirs.push('LONG'); if(res?.htfTrend==='down')dirs.push('SHORT');
+  if(res?.waveEngine?.overall==='BULLISH')dirs.push('LONG'); if(res?.waveEngine?.overall==='BEARISH')dirs.push('SHORT');
+  const L=dirs.filter(x=>x==='LONG').length,S=dirs.filter(x=>x==='SHORT').length,total=L+S;
+  const agreement=total?Math.max(L,S)/total*100:50;
+  if(Math.abs(L-S)<=1&&total>=3)parts.push('شواهد جهت‌دار متناقض‌اند');
+  if(res?.volatilityContext?.volatility==='HIGH_VOL')parts.push('نوسان بالا عدم‌قطعیت اجرا را افزایش می‌دهد');
+  if(res?.breakoutQuality?.fakeoutRisk>=55)parts.push('ریسک fakeout بالاست');
+  const score=Math.round(Math.max(0,Math.min(100,agreement-parts.length*8)));
+  return {score,agreement:Math.round(agreement),reasons:parts};
+}
+function executionCostV8(res){
+  const d=res?.derivatives||{}, spread=d.spreadBps;
+  const spreadBps=Number.isFinite(spread)?spread:5;
+  const atrPct=res?.volatilityContext?.atrPct||0;
+  const slip=V8_CFG.baseSlippageBps+Math.min(20,atrPct*0.75);
+  const roundTripBps=2*V8_CFG.feeBps+2*slip+2*spreadBps;
+  const score=Math.max(0,Math.min(100,Math.round(100-roundTripBps*2-(atrPct>V8_CFG.maxVolPct?20:0))));
+  return {spreadBps:+spreadBps.toFixed(2),estimatedSlippageBps:+slip.toFixed(2),feeBps:V8_CFG.feeBps,estimatedRoundTripBps:+roundTripBps.toFixed(2),score};
+}
+function applyAdvancedQuantLayer(res,candles,symbol){
+  if(!res||res.insufficient)return res;
+  res.volatilityContext=volatilityRegimeV8(candles);
+  res.breakoutQuality=breakoutQualityV8(candles,res.chartPattern,res.volumeMetrics||res.volume);
+  res.executionCost=executionCostV8(res);
+  res.uncertainty=evidenceUncertaintyV8(res);
+  const riskBase=Math.min(V8_CFG.maxRiskPct,Math.max(.25,Number(els?.riskPctInput?.value)||1));
+  const volPenalty=res.volatilityContext?.volatility==='HIGH_VOL'?.65:res.volatilityContext?.volatility==='LOW_VOL'?1.1:1;
+  const uncertaintyFactor=Math.max(.35,(res.uncertainty.score||50)/100);
+  const executionFactor=Math.max(.35,(res.executionCost.score||50)/100);
+  res.quantRisk={baseRiskPct:+riskBase.toFixed(2),recommendedRiskPct:+(riskBase*volPenalty*uncertaintyFactor*executionFactor).toFixed(2),volatilityMultiplier:volPenalty,uncertaintyMultiplier:+uncertaintyFactor.toFixed(2),executionMultiplier:+executionFactor.toFixed(2)};
+  const qPenalty=(100-(res.uncertainty.score||50))*.08+(100-(res.executionCost.score||50))*.05+(res.breakoutQuality?.fakeoutRisk||0)*.04;
+  res.setupQuality=clamp(Math.round((res.setupQuality||0)-qPenalty),0,100);
+  res.confidence=clamp(Math.round(Math.min(res.confidence||50,50+(res.uncertainty.score||50)*.45)),5,95);
+  res.notes=res.notes||[];
+  res.notes.push(`Regime: ${res.volatilityContext?.trend||'N/A'} / ${res.volatilityContext?.volatility||'N/A'} | ATR%=${res.volatilityContext?.atrPct??'—'}.`);
+  res.notes.push(`Execution cost تخمینی: ${res.executionCost.estimatedRoundTripBps} bps | کیفیت اجرا ${res.executionCost.score}/100.`);
+  res.notes.push(`Uncertainty/Evidence Agreement=${res.uncertainty.score}/100 | Fakeout Risk=${res.breakoutQuality?.fakeoutRisk??'—'}/100.`);
+  if(res.volatilityContext?.volatility==='HIGH_VOL'&&res.verdictClass!=='v-hold'){res.verdict='🟡 WAIT — نوسان بالا است؛ ورود فقط با سایز کاهش‌یافته و تأیید شکست معتبر';res.verdictClass='v-hold';res.risk=null;}
+  if((res.uncertainty.score||0)<40&&res.verdictClass!=='v-hold'){res.verdict='🟡 WAIT — شواهد جهت‌دار به‌اندازه کافی هم‌راستا نیستند';res.verdictClass='v-hold';res.risk=null;}
+  return res;
+}
+function quantStatsV9(trades, equityCurve){
+  const rets=trades.map(t=>t.r).filter(Number.isFinite);
+  const wins=rets.filter(x=>x>0), losses=rets.filter(x=>x<0);
+  const avg=meanV8(rets)||0;
+  const grossWin=wins.reduce((a,b)=>a+b,0), grossLoss=Math.abs(losses.reduce((a,b)=>a+b,0));
+  const downside=losses.length?Math.sqrt(meanV8(losses.map(x=>x*x))||0):0;
+  const mean=avg, sd=stdevV8(rets)||0;
+  const sharpe=sd?mean/sd*Math.sqrt(Math.max(1,rets.length)):null;
+  let peak=1,eq=1,maxDD=0;
+  for(const r of rets){eq*=1+r;peak=Math.max(peak,eq);maxDD=Math.max(maxDD,(peak-eq)/peak);}
+  const hitRate=rets.length?wins.length/rets.length:0;
+  return {trades:rets.length,wins:wins.length,losses:losses.length,winRate:hitRate*100,profitFactor:grossLoss?grossWin/grossLoss:null,expectancy:avg,avgWin:meanV8(wins)||0,avgLoss:meanV8(losses)||0,maxDrawdown:maxDD*100,sharpe,equity:eq,downside,avgR:avg};
+}
+function strategySignalV9(c){
+  if(c.length<140)return null;
+  const closes=c.map(x=>x.close), A=atr(c,14)||0, e20=emaSeries(closes,20).at(-1), e50=emaSeries(closes,50).at(-1), r=rsi(closes,14), ad=adx(c,14)?.adx||0;
+  if(!A||!Number.isFinite(e20)||!Number.isFinite(e50)||r==null)return null;
+  const last=c.at(-1), prev=c.at(-2), body=Math.abs(last.close-last.open), range=Math.max(last.high-last.low,1e-12);
+  const bullish=last.close>e20&&e20>e50&&r>52&&r<72&&ad>=20&&last.close>prev.high&&body/range>.45;
+  const bearish=last.close<e20&&e20<e50&&r<48&&r>28&&ad>=20&&last.close<prev.low&&body/range>.45;
+  if(bullish)return {dir:'LONG',atr:A,entry:last.close,sl:last.close-A*1.2,tp:last.close+A*2.0};
+  if(bearish)return {dir:'SHORT',atr:A,entry:last.close,sl:last.close+A*1.2,tp:last.close-A*2.0};
+  return null;
+}
+function backtestEngineV9(candles, cfg={}){
+  const warm=cfg.warm||140, feeBps=cfg.feeBps??4, slipBps=cfg.slipBps??2, risk=cfg.risk??0.01;
+  const c=candles.slice(); if(c.length<warm+20)return {ok:false,reason:'داده برای بک‌تست کافی نیست'};
+  const trades=[]; let position=null;
+  for(let i=warm;i<c.length-2;i++){
+    const w=c.slice(0,i+1), bar=c[i+1];
+    if(position){
+      let exit=null,reason=null;
+      if(position.dir==='LONG'){ if(bar.low<=position.sl){exit=position.sl;reason='SL';} else if(bar.high>=position.tp){exit=position.tp;reason='TP';} }
+      else { if(bar.high>=position.sl){exit=position.sl;reason='SL';} else if(bar.low<=position.tp){exit=position.tp;reason='TP';} }
+      if(exit!=null){
+        const gross=position.dir==='LONG'?(exit-position.entry)/position.entry:(position.entry-exit)/position.entry;
+        const cost=(feeBps*2+slipBps*2)/10000;
+        const net=gross-cost;
+        trades.push({r:net,dir:position.dir,reason,entry:position.entry,exit}); position=null;
+      }
+    }
+    if(!position){
+      const sig=strategySignalV9(w);
+      if(sig){
+        position={...sig, entry:bar.open*(1+(sig.dir==='LONG'?slipBps:-slipBps)/10000)};
+      }
+    }
+  }
+  const stats=quantStatsV9(trades);
+  return {ok:true,...stats,feeBps,slipBps,risk,tradesDetail:trades};
+}
+function regimeBucketV9(c){
+  const v=volatilityRegimeV8(c); return v?.regimeKey||'UNKNOWN';
+}
+function regimeBreakdownV9(candles){
+  const buckets={}; const warm=160;
+  for(let i=warm;i<candles.length-2;i++){
+    const sig=strategySignalV9(candles.slice(0,i+1)); if(!sig)continue;
+    const reg=regimeBucketV9(candles.slice(Math.max(0,i-80),i+1));
+    const bar=candles[i+1]; let exit=null;
+    if(sig.dir==='LONG'){if(bar.low<=sig.sl)exit=sig.sl;else if(bar.high>=sig.tp)exit=sig.tp;}
+    else {if(bar.high>=sig.sl)exit=sig.sl;else if(bar.low<=sig.tp)exit=sig.tp;}
+    if(exit==null)continue;
+    const r=(sig.dir==='LONG'?(exit-sig.entry)/sig.entry:(sig.entry-exit)/sig.entry)-.0012;
+    (buckets[reg]??=[]).push({r});
+  }
+  return Object.entries(buckets).map(([reg,tr])=>({reg,...quantStatsV9(tr)}));
+}
+function walkForwardV9(candles){
+  const n=candles.length;if(n<420)return {ok:false,reason:'حداقل ۴۲۰ کندل برای Walk-Forward توصیه می‌شود'};
+  const train=Math.floor(n*.55), test=Math.floor(n*.15), step=test, windows=[];
+  for(let start=0;start+train+test<=n;start+=step){
+    const tr=backtestEngineV9(candles.slice(start,start+train)), te=backtestEngineV9(candles.slice(start+train,start+train+test));
+    windows.push({start,trainTrades:tr.trades,testTrades:te.trades,testPF:te.profitFactor,testWR:te.winRate,testDD:te.maxDrawdown,testExp:te.expectancy});
+  }
+  const valid=windows.filter(x=>x.testTrades>=5), pfs=valid.map(x=>x.testPF).filter(Number.isFinite);
+  const avgPF=meanV8(pfs),avgWR=meanV8(valid.map(x=>x.testWR)),avgDD=meanV8(valid.map(x=>x.testDD)),exp=meanV8(valid.map(x=>x.testExp));
+  const pass=valid.length>=3&&avgPF!=null&&avgPF>1.1&&avgWR>=45&&exp>0;
+  return {ok:true,windows,validWindows:valid.length,avgPF,avgWR,avgDD,avgExpectancy:exp,passed:pass};
+}
+function monteCarloV9(trades, n=1000){
+  const r=trades.map(t=>t.r).filter(Number.isFinite); if(r.length<20)return {ok:false,reason:'حداقل ۲۰ معامله برای Monte Carlo لازم است'};
+  const finals=[],dds=[];
+  for(let k=0;k<n;k++){
+    let eq=1,peak=1,dd=0;
+    for(let i=0;i<r.length;i++){const x=r[Math.floor(Math.random()*r.length)];eq*=1+x;peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak);} finals.push(eq-1);dds.push(dd);
+  }
+  return {ok:true,runs:n,p5:percentileV8(finals,.05),p50:percentileV8(finals,.5),p95:percentileV8(finals,.95),dd95:percentileV8(dds,.95),lossProb:finals.filter(x=>x<0).length/n};
+}
+function sensitivityV9(candles){
+  const configs=[{name:'Base',feeBps:4,slipBps:2},{name:'Cost +50%',feeBps:6,slipBps:3},{name:'Cost x2',feeBps:8,slipBps:4},{name:'Conservative',feeBps:6,slipBps:4}];
+  return configs.map(x=>({name:x.name,...backtestEngineV9(candles,x)}));
+}
+function validationGateV9(bt,wf,mc,sens){
+  const reasons=[];
+  if(!bt?.ok||bt.trades<100)reasons.push('حداقل ۱۰۰ معامله ثبت نشده');
+  if(!wf?.passed)reasons.push('Walk-Forward پایدار نیست');
+  if(!mc?.ok||mc.lossProb>.35)reasons.push('Monte Carlo ریسک زیان بالا');
+  const stressed=sens?.find(x=>x.name==='Cost x2');
+  if(!stressed||!Number.isFinite(stressed.profitFactor)||stressed.profitFactor<=1)reasons.push('استراتژی در هزینه اجرای ۲× مقاوم نیست');
+  return {validated:reasons.length===0,reasons};
+}
+async function runResearchV9(){
+  const out=document.getElementById('researchContent'); if(out)out.textContent='در حال اجرای Institutional Validation...';
+  try{
+    const symbol=els.symbol.value.trim().toUpperCase(), interval=els.interval.value;
+    const c=await fetchKlines(symbol,interval,1000);
+    const bt=backtestEngineV9(c,{feeBps:4,slipBps:2}),wf=walkForwardV9(c),mc=monteCarloV9(bt.tradesDetail||[],1000),sens=sensitivityV9(c),reg=regimeBreakdownV9(c),gate=validationGateV9(bt,wf,mc,sens);
+    const fmt=x=>x==null||!Number.isFinite(x)?'—':x.toFixed(2);
+    if(out)out.innerHTML=`<div class="row"><span>Trades</span><span>${bt.trades}</span></div><div class="row"><span>Win Rate</span><span>${fmt(bt.winRate)}%</span></div><div class="row"><span>Profit Factor</span><span>${fmt(bt.profitFactor)}</span></div><div class="row"><span>Expectancy / trade</span><span>${(bt.expectancy*100).toFixed(3)}%</span></div><div class="row"><span>Sharpe-like</span><span>${fmt(bt.sharpe)}</span></div><div class="row"><span>Max Drawdown</span><span>${fmt(bt.maxDrawdown)}%</span></div><div class="row"><span>Walk-Forward</span><span>${wf.passed?'PASS':'FAIL'} — ${wf.validWindows} windows</span></div><div class="row"><span>Monte Carlo P(loss)</span><span>${mc.ok?fmt(mc.lossProb*100)+'%':'—'}</span></div><div class="row"><span>MC 95% DD</span><span>${mc.ok?fmt(mc.dd95*100)+'%':'—'}</span></div><div class="row"><span>Validation Gate</span><span>${gate.validated?'🟢 VALIDATED':'🔴 NOT VALIDATED'}</span></div><div class="muted" style="margin-top:8px"><b>دلایل:</b> ${gate.reasons.length?gate.reasons.join(' • '):'تمام شروط پایه عبور کردند.'}</div><div class="muted" style="margin-top:8px"><b>Regime breakdown:</b> ${reg.map(x=>`${x.reg}: ${x.trades}T / PF ${fmt(x.profitFactor)} / DD ${fmt(x.maxDrawdown)}%`).join(' | ')||'داده کافی نیست'}</div><div class="muted" style="margin-top:8px"><b>Cost sensitivity:</b> ${sens.map(x=>`${x.name}: PF ${fmt(x.profitFactor)}`).join(' | ')}</div><div class="muted" style="margin-top:8px">این موتور برای اعتبارسنجی پژوهشی است؛ حتی PASS به معنی تضمین سود آینده نیست. Look-ahead، survivorship و overfitting باید همچنان کنترل شوند.</div>`;
+    window.__V9_VALIDATION={symbol,interval,bt,wf,mc,sens,reg,gate};
+  }catch(err){if(out)out.textContent='خطا در Institutional Validation: '+err.message;}
+}
+const backtestBtnEl=document.getElementById('backtestBtn'); if(backtestBtnEl)backtestBtnEl.onclick=runResearchV9;
 
 /* =========================================================
    PRO TRADER LAYER V4
@@ -1772,5 +2091,301 @@ function applyDerivativeCrowding(res,d){
   return res;
 }
 
+
+/* =========================================================
+   TRUST / VALIDATION GATE V5
+   هدف: جلوگیری از اینکه «امتیاز» با «احتمال برد» اشتباه گرفته شود.
+   تا وقتی بک‌تست و Walk-Forward معتبر ثبت نشده، خروجی قابل اجرای زنده نیست.
+   ========================================================= */
+const TRUST_CFG={maxClosedAgeBars:2,minCandles:100,maxGapBars:2};
+function intervalMsPro(tf){const m={"1m":60000,"3m":180000,"5m":300000,"15m":900000,"30m":1800000,"1h":3600000,"2h":7200000,"4h":14400000,"6h":21600000,"12h":43200000,"1d":86400000,"3d":259200000,"1w":604800000};return m[tf]||3600000;}
+function validateMarketDataTrust(candles,interval,mtf){
+  const checks=[]; let ok=true;
+  const n=candles?.length||0;
+  if(n<TRUST_CFG.minCandles){checks.push({ok:false,label:'تعداد کندل کافی نیست'});ok=false;}else checks.push({ok:true,label:`${n} کندل بسته‌شده`});
+  let malformed=0,dupes=0,gaps=0;
+  for(let i=0;i<n;i++){
+    const c=candles[i];
+    if(!(Number.isFinite(c.open)&&Number.isFinite(c.high)&&Number.isFinite(c.low)&&Number.isFinite(c.close)&&Number.isFinite(c.volume))||c.volume<0||c.high<Math.max(c.open,c.close)||c.low>Math.min(c.open,c.close)||c.high<c.low) malformed++;
+    if(i&&c.time<=candles[i-1].time)dupes++;
+    if(i){const expected=intervalMsPro(interval);const d=c.time-candles[i-1].time;if(d>expected*TRUST_CFG.maxGapBars*1.05)gaps++;}
+  }
+  if(malformed){checks.push({ok:false,label:`${malformed} کندل با OHLCV نامعتبر`});ok=false;}else checks.push({ok:true,label:'OHLCV ساختاری معتبر'});
+  if(dupes){checks.push({ok:false,label:'تکرار/ترتیب زمانی نامعتبر'});ok=false;}else checks.push({ok:true,label:'ترتیب زمانی معتبر'});
+  if(gaps>0){checks.push({ok:false,label:`${gaps} شکاف بزرگ در داده`});ok=false;}else checks.push({ok:true,label:'بدون شکاف بزرگ'});
+  const lastClosed=candles?.at(-1)?.closeTime||0, ageMs=Date.now()-lastClosed, maxAge=intervalMsPro(interval)*TRUST_CFG.maxClosedAgeBars;
+  const fresh=lastClosed>0&&ageMs>=0&&ageMs<=maxAge;
+  checks.push({ok:fresh,label:fresh?'داده آخر تازه است':`داده آخر قدیمی است (${Math.max(0,Math.round(ageMs/60000))} دقیقه)`}); if(!fresh)ok=false;
+  const mtfAvail=mtf?.available===true;
+  checks.push({ok:mtfAvail,label:mtfAvail?'MTF در دسترس است':'MTF کامل در دسترس نیست'});
+  return {ok,checks,lastClosedTime:lastClosed,ageMs,source:'Binance Spot REST',closedOnly:true};
+}
+function applyTrustGate(res,candles,symbol,interval){
+  if(!res||res.insufficient)return res;
+  const data=validateMarketDataTrust(candles,interval,res.mtfConfluence);
+  const validation=res.backtestValidation||null;
+  // فعلاً این پروژه سابقهٔ بک‌تست/Walk-Forward قابل تأیید در خود اپ ندارد.
+  const validated=Boolean(validation?.walkForward?.passed&&validation?.outOfSample?.passed&&Number(validation?.trades)>=100);
+  const reasons=[];
+  if(!data.ok)reasons.push('کیفیت/تازگی داده برای ورود زنده کافی نیست');
+  if(!validated)reasons.push('بک‌تست و Walk-Forward خارج‌ازنمونه هنوز در اپ ثبت و تأیید نشده است');
+  const status=!data.ok?'BLOCKED':validated?'TRADE_READY':'PAPER_ONLY';
+  res.trust={status,label:status==='TRADE_READY'?'قابل بررسی برای اجرای زنده':status==='PAPER_ONLY'?'فقط Paper Trading':'مسدود تا رفع مشکل داده',score:proClamp(Math.round((data.ok?70:25)+(validated?30:0))),data,validation:{available:Boolean(validation),validated},reasons};
+  if(status!=='TRADE_READY'){
+    if(res.verdictClass==='v-buy'||res.verdictClass==='v-sell'){
+      res.verdictClass='v-hold';
+      res.verdict=status==='BLOCKED'?'⛔ NO TRADE — کیفیت داده برای ورود زنده کافی نیست':'🟡 PAPER ONLY — ستاپ وجود دارد، اما هنوز اعتبارسنجی آماری خارج‌ازنمونه ندارد';
+      res.entryState=status==='BLOCKED'?'DATA BLOCKED':'PAPER ONLY';
+      res.risk=null;
+    }
+  }
+  res.confidence=Math.min(Number(res.confidence)||0,status==='TRADE_READY'?95:49);
+  return res;
+}
+
+
+/* ================= V6 PIVOT-FIRST EVIDENCE ENGINE ================= */
+(function(){
+const legacyAnalyze=analyze;
+const safeNum=x=>Number.isFinite(+x)?+x:null;
+function atrSafe(c){try{return Number.isFinite(atr(c,14))?atr(c,14):0}catch(e){return 0}}
+function pivots(c,left=3,right=3){const a=[],b=[],A=atrSafe(c);for(let i=left;i<c.length-right;i++){const x=c[i],L=c.slice(i-left,i),R=c.slice(i+1,i+1+right);const h=Math.max(...L.map(z=>z.high)),hh=Math.max(...R.map(z=>z.high)),l=Math.min(...L.map(z=>z.low)),ll=Math.min(...R.map(z=>z.low));if(x.high>=h&&x.high>=hh&&Math.min(x.high-h,x.high-hh)>=A*.08)a.push({idx:i,time:x.time,price:x.high,type:'high'});if(x.low<=l&&x.low<=ll&&Math.min(l-x.low,ll-x.low)>=A*.08)b.push({idx:i,time:x.time,price:x.low,type:'low'});}return {highs:a,lows:b}}
+function seq(P){const all=[...P.highs,...P.lows].sort((a,b)=>a.idx-b.idx),o=[];for(const p of all){const q=o.at(-1);if(!q||q.type!==p.type)o.push(p);else if((p.type==='high'&&p.price>q.price)||(p.type==='low'&&p.price<q.price))o[o.length-1]=p;}return o}
+function cluster(ps,tol){const g=[];for(const p of [...ps].sort((a,b)=>a.price-b.price)){let z=g.at(-1);if(z&&Math.abs(p.price-z.price)/z.price*100<=tol){z.items.push(p);z.price=z.items.reduce((s,x)=>s+x.price,0)/z.items.length;z.low=Math.min(z.low,p.price);z.high=Math.max(z.high,p.price)}else g.push({price:p.price,low:p.price,high:p.price,items:[p]})}return g.map(z=>({price:z.price,low:z.low,high:z.high,touches:z.items.length,pivots:z.items,strength:Math.min(100,35+z.items.length*15)}))}
+function sr(c,P,A){const last=c.at(-1).close,tol=Math.max(.08,Math.min(.35,A&&last?A/last*100*.75:.15));return{supports:cluster(P.lows.filter(x=>x.price<last),tol).sort((a,b)=>Math.abs(a.price-last)-Math.abs(b.price-last)).slice(0,5),resistances:cluster(P.highs.filter(x=>x.price>last),tol).sort((a,b)=>Math.abs(a.price-last)-Math.abs(b.price-last)).slice(0,5),tolerancePct:tol}}
+function rsiSeries(c){const x=c.map(z=>z.close),n=14,o=Array(x.length).fill(null);if(x.length<=n)return o;let g=0,l=0;for(let i=1;i<=n;i++){let d=x[i]-x[i-1];g+=Math.max(d,0);l+=Math.max(-d,0)}g/=n;l/=n;o[n]=l?100-100/(1+g/l):100;for(let i=n+1;i<x.length;i++){let d=x[i]-x[i-1];g=(g*(n-1)+Math.max(d,0))/n;l=(l*(n-1)+Math.max(-d,0))/n;o[i]=l?100-100/(1+g/l):100}return o}
+function emaS(x,n){const o=Array(x.length).fill(null);if(x.length<n)return o;let e=x.slice(0,n).reduce((a,b)=>a+b,0)/n;o[n-1]=e;const k=2/(n+1);for(let i=n;i<x.length;i++){e=x[i]*k+e*(1-k);o[i]=e}return o}
+function divergences(c,P){const r=rsiSeries(c),m12=emaS(c.map(x=>x.close),12),m26=emaS(c.map(x=>x.close),26),mh=c.map((_,i)=>m12[i]!=null&&m26[i]!=null?m12[i]-m26[i]:null),out=[];for(const [name,s] of [['RSI',r],['MACD',mh]])for(const t of ['low','high']){const ps=(t==='low'?P.lows:P.highs).slice(-10);if(ps.length<2)continue;const a=ps.at(-2),b=ps.at(-1),va=s[a.idx],vb=s[b.idx];if(va==null||vb==null)continue;if(t==='low'&&b.price<a.price&&vb>va)out.push({type:'bullish',indicator:name,pivotA:a,pivotB:b,evidence:'Price LL + Indicator HL'});if(t==='high'&&b.price>a.price&&vb<va)out.push({type:'bearish',indicator:name,pivotA:a,pivotB:b,evidence:'Price HH + Indicator LH'})}return out}
+function line(ps){if(ps.length<2)return null;const n=ps.length,sx=ps.reduce((s,p)=>s+p.idx,0),sy=ps.reduce((s,p)=>s+p.price,0),sxy=ps.reduce((s,p)=>s+p.idx*p.price,0),sxx=ps.reduce((s,p)=>s+p.idx*p.idx,0),d=n*sxx-sx*sx||1,sl=(n*sxy-sx*sy)/d;return{slope:sl,intercept:(sy-sl*sx)/n,points:ps}}
+function patterns(c,P,A){const H=P.highs.slice(-8),L=P.lows.slice(-8),last=c.at(-1).close,tol=Math.max(.25,Math.min(1.25,A/last*100*1.25)),eq=(a,b)=>Math.abs(a-b)/b*100<=tol,out=[];if(H.length>=2){const a=H.at(-2),b=H.at(-1),n=L.filter(x=>x.idx>a.idx&&x.idx<b.idx).at(-1);if(n&&eq(a.price,b.price))out.push({name:'Double Top',status:last<n.price?'CONFIRMED':'POTENTIAL',dir:'bearish',neckline:n.price,evidence:[a,b,n]})}if(L.length>=2){const a=L.at(-2),b=L.at(-1),n=H.filter(x=>x.idx>a.idx&&x.idx<b.idx).at(-1);if(n&&eq(a.price,b.price))out.push({name:'Double Bottom',status:last>n.price?'CONFIRMED':'POTENTIAL',dir:'bullish',neckline:n.price,evidence:[a,b,n]})}if(H.length>=3){const [a,b,d]=H.slice(-3),n1=L.find(x=>x.idx>a.idx&&x.idx<b.idx),n2=L.find(x=>x.idx>b.idx&&x.idx<d.idx);if(n1&&n2&&b.price>a.price&&b.price>d.price&&eq(a.price,d.price)){const n=(n1.price+n2.price)/2;out.push({name:'Head & Shoulders',status:last<n?'CONFIRMED':'POTENTIAL',dir:'bearish',neckline:n,evidence:[a,b,d,n1,n2]})}}if(L.length>=3){const [a,b,d]=L.slice(-3),n1=H.find(x=>x.idx>a.idx&&x.idx<b.idx),n2=H.find(x=>x.idx>b.idx&&x.idx<d.idx);if(n1&&n2&&b.price<a.price&&b.price<d.price&&eq(a.price,d.price)){const n=(n1.price+n2.price)/2;out.push({name:'Inverse Head & Shoulders',status:last>n?'CONFIRMED':'POTENTIAL',dir:'bullish',neckline:n,evidence:[a,b,d,n1,n2]})}}if(H.length>=3&&L.length>=3){const U=line(H.slice(-5)),D=line(L.slice(-5)),x=c.length-1,up=U.slope,lo=D.slope,u=up*x+U.intercept,d=lo*x+D.intercept,sx=Math.min(H.slice(-5)[0].idx,L.slice(-5)[0].idx),w0=(up*sx+U.intercept)-(lo*sx+D.intercept),w=u-d,flat=last*.0006;let name=null,dir='neutral';if(w0>0&&w<w0*.88){if(Math.abs(up)<flat&&lo>flat){name='Ascending Triangle';dir='bullish'}else if(up<-flat&&Math.abs(lo)<flat){name='Descending Triangle';dir='bearish'}else if(up<-flat&&lo>flat)name='Symmetrical Triangle';else if(up>flat&&lo>flat){name='Rising Wedge';dir='bearish'}else if(up<-flat&&lo<-flat){name='Falling Wedge';dir='bullish'}}else if(w>w0*1.12)name='Diverging / Broadening Triangle';else if(up>flat&&lo>flat){name='Ascending Channel';dir='bullish'}else if(up<-flat&&lo<-flat){name='Descending Channel';dir='bearish'}else if(Math.abs(up)<flat&&Math.abs(lo)<flat)name='Horizontal Range';if(name){const buf=A*.15,bo=last>u+buf?'up':last<d-buf?'down':null;out.push({name,dir,status:bo?'BREAKOUT_'+bo:'INSIDE',breakout:bo,upperLine:{slope:up,intercept:U.intercept,now:u},lowerLine:{slope:lo,intercept:D.intercept,now:d},evidence:[...H.slice(-5),...L.slice(-5)]})}}return out}
+function waves(c,P,A){const s=seq(P).slice(-9),w=[];for(let i=1;i<s.length;i++){const a=s[i-1],b=s[i],dur=Math.max(1,b.idx-a.idx),eff=A?Math.abs(b.price-a.price)/(A*dur):0;w.push({from:a,to:b,dir:b.price>a.price?'up':'down',duration:dur,displacementPct:+((b.price-a.price)/a.price*100).toFixed(2),efficiency:+eff.toFixed(2),strength:eff>=2.2?'VERY STRONG':eff>=1.4?'STRONG':eff>=.8?'NORMAL':eff>=.4?'WEAK':'VERY WEAK'})}const u=w.filter(x=>x.dir==='up'),d=w.filter(x=>x.dir==='down'),avg=a=>a.length?a.reduce((s,x)=>s+x.efficiency,0)/a.length:0,b=Math.max(0,Math.min(100,Math.round(50+(avg(u)-avg(d))*18+(w.at(-1)?.dir==='up'?10:-10)))),br=Math.max(0,Math.min(100,Math.round(50+(avg(d)-avg(u))*18+(w.at(-1)?.dir==='down'?10:-10))));return{waves:w.slice(-6),lastWave:w.at(-1)||null,bullishPressure:b,bearishPressure:br,overall:b-br>=10?'BULLISH':br-b>=10?'BEARISH':'BALANCED',acceleration:w.length>=2&&w.at(-1).dir===w.at(-2).dir?(w.at(-1).efficiency>w.at(-2).efficiency*1.1?'ACCELERATING':w.at(-1).efficiency<w.at(-2).efficiency*.9?'DECELERATING':'STABLE'):'N/A'}}
+function enrich(res,c){const A=atrSafe(c),P=pivots(c),S=sr(c,P,A),D=divergences(c,P),Pat=patterns(c,P,A),W=waves(c,P,A);res.pivotEngine={highs:P.highs.slice(-12),lows:P.lows.slice(-12),sequence:seq(P).slice(-16)};res.supports=S.supports;res.resistances=S.resistances;res.divergences=D;res.pivotPatterns=Pat;res.waveEngine=W;res.recentSwingHighs=P.highs.slice(-8).map(x=>x.price);res.recentSwingLows=P.lows.slice(-8).map(x=>x.price);res.chartPattern=Pat.find(x=>['Ascending Triangle','Descending Triangle','Symmetrical Triangle','Rising Wedge','Falling Wedge','Ascending Channel','Descending Channel','Horizontal Range','Diverging / Broadening Triangle'].includes(x.name))||null;res.evidenceGate={noInventedLevels:true,supportsFromConfirmedPivots:true,resistancesFromConfirmedPivots:true,confirmedPatterns:Pat.filter(x=>x.status==='CONFIRMED').map(x=>x.name)};res.notes=res.notes||[];res.notes.push(D.length?D.map(x=>`واگرایی ${x.type==='bullish'?'مثبت':'منفی'} ${x.indicator}: ${x.evidence} روی Pivotهای ${x.pivotA.price.toFixed(4)} → ${x.pivotB.price.toFixed(4)}.`).join(' | '):'واگرایی معتبر Pivot-to-Pivot در RSI/MACD دیده نشد.');res.notes.push(Pat.length?Pat.map(x=>`Pattern مبتنی بر Pivot: ${x.name} — ${x.status}${x.neckline?` — Neckline ${x.neckline.toFixed(4)}`:''}.`).join(' | '):'Pattern معتبر مبتنی بر Pivot شناسایی نشد.');return res}
+analyze=function(c,h,m){return enrich(legacyAnalyze(c,h,m),c)};
+const oldDraw=drawAnalysisOnChart; drawAnalysisOnChart=async function(res){await oldDraw(res);try{if(!tvWidget||!chartReadyPromise)return;await chartReadyPromise;const ch=tvWidget.activeChart();const txt=p=>{try{ch.createShape({time:Math.floor((p.time||Date.now())/1000),price:p.price},{shape:'text',lock:true,disableSelection:true,disableSave:true,text:`${p.type==='high'?'PH':'PL'} ${p.price.toFixed(4)}`,overrides:{color:p.type==='high'?'#ef5350':'#26a69a',fontsize:9}})}catch(e){}};res.pivotEngine?.highs?.slice(-8).forEach(txt);res.pivotEngine?.lows?.slice(-8).forEach(txt);res.divergences?.slice(-4).forEach(d=>txt({...d.pivotB,price:d.pivotB.price}));}catch(e){}};
+const oldRender=renderResult;renderResult=function(res,s,i,t){oldRender(res,s,i,t);let card=document.getElementById('pivotEvidenceCard');if(!card){card=document.createElement('div');card.id='pivotEvidenceCard';card.className='card';const w=document.getElementById('waveCard');w?.parentNode?.insertBefore(card,w);card.innerHTML='<h3>🧭 Pivot Evidence / Wave / Divergence</h3><div id="pivotEvidenceBody"></div>'}const b=document.getElementById('pivotEvidenceBody');if(!b||res.insufficient)return;card.style.display='block';const f=x=>Number(x).toFixed(4);let h=`<div class="row"><span>Pivot High / Low</span><span>${res.pivotEngine.highs.length} / ${res.pivotEngine.lows.length}</span></div>`;h+=`<div class="row"><span>Support / Resistance</span><span>${res.supports.length} / ${res.resistances.length} — Pivot-based</span></div>`;h+='<p class="muted">واگرایی:</p>'+((res.divergences||[]).map(d=>`<div class="row"><span>${d.type==='bullish'?'🟢':'🔴'} ${d.indicator}</span><span>${d.type==='bullish'?'مثبت':'منفی'} · ${f(d.pivotA.price)} → ${f(d.pivotB.price)}</span></div>`).join('')||'<span class="muted">نداریم</span>');h+='<p class="muted">Pattern:</p>'+((res.pivotPatterns||[]).map(p=>`<div><span class="tag ${p.status==='CONFIRMED'?'tag-up':'tag-neu'}">${p.name}</span> ${p.status}${p.neckline?` · ${f(p.neckline)}`:''}</div>`).join('')||'<span class="muted">معتبر نیست</span>');const w=res.waveEngine;if(w?.lastWave)h+=`<p class="muted">آخرین موج: ${w.lastWave.dir==='up'?'⬆':'⬇'} ${w.lastWave.strength} · ${w.lastWave.efficiency} · ${w.lastWave.duration} candles</p><div class="row"><span>فشار Bull/Bear</span><span>${w.bullishPressure} / ${w.bearishPressure}</span></div><div class="row"><span>شتاب موج</span><span>${w.acceleration}</span></div>`;b.innerHTML=h};
+})();
+
+
+// =========================================================
+// V10 — Strategy Attribution & Edge Discovery
+// هدف: اندازه‌گیری اینکه کدام evidence واقعاً با expectancy مثبت همراه است.
+// نکته: این لایه پژوهشی است و به‌تنهایی Trade Ready را فعال نمی‌کند.
+// =========================================================
+function edgeFeatureSnapshotV10(c){
+  if(c.length<160)return null;
+  const closes=c.map(x=>x.close), last=c.at(-1), prev=c.at(-2);
+  const e20=emaSeries(closes,20).at(-1), e50=emaSeries(closes,50).at(-1);
+  const r=rsi(closes,14), ad=adx(c,14)?.adx||0, A=atr(c,14)||0;
+  const avgVol=meanV8(c.slice(-21,-1).map(x=>x.volume))||0;
+  const vr=avgVol?last.volume/avgVol:1;
+  const body=Math.abs(last.close-last.open), range=Math.max(last.high-last.low,1e-12);
+  const P=pivots(c), seqNow=seq(P).slice(-6);
+  const structureBull=seqNow.length>=3 && seqNow.at(-1).price>seqNow.at(-2).price && seqNow.at(-1).type==='high';
+  const structureBear=seqNow.length>=3 && seqNow.at(-1).price<seqNow.at(-2).price && seqNow.at(-1).type==='low';
+  const bullishCandle=last.close>last.open && body/range>.55;
+  const bearishCandle=last.close<last.open && body/range>.55;
+  const breakoutUp=last.close>prev.high && body/range>.45;
+  const breakoutDown=last.close<prev.low && body/range>.45;
+  const trendBull=Number.isFinite(e20)&&Number.isFinite(e50)&&last.close>e20&&e20>e50;
+  const trendBear=Number.isFinite(e20)&&Number.isFinite(e50)&&last.close<e20&&e20<e50;
+  const rsiBull=r!=null&&r>52&&r<72, rsiBear=r!=null&&r<48&&r>28;
+  const adxStrong=ad>=20;
+  const volumeExpansion=vr>=1.25;
+  const volA=A&&last.close?A/last.close:0;
+  return {
+    trendBull,trendBear,rsiBull,rsiBear,adxStrong,volumeExpansion,
+    breakoutUp,breakoutDown,bullishCandle,bearishCandle,structureBull,structureBear,
+    highVol:volA>=.045, lowVol:volA<.018, atrPct:volA*100, volumeRatio:vr, rsi:r, adx:ad
+  };
+}
+function realizedOutcomeV10(c, i, dir, horizon=6){
+  const entry=c[i]?.close; if(!Number.isFinite(entry))return null;
+  const end=Math.min(c.length-1,i+horizon);
+  let mfe=0, mae=0;
+  for(let j=i+1;j<=end;j++){
+    const up=(c[j].high-entry)/entry, down=(entry-c[j].low)/entry;
+    if(dir==='LONG'){mfe=Math.max(mfe,up);mae=Math.max(mae,down)}
+    else {mfe=Math.max(mfe,down);mae=Math.max(mae,up)}
+  }
+  const ret=(dir==='LONG'?(c[end].close-entry):(entry-c[end].close))/entry;
+  return {ret,mfe,mae,win:ret>0};
+}
+function edgeDiscoveryV10(candles){
+  const c=candles.slice(), warm=160, horizon=6;
+  if(c.length<warm+40)return {ok:false,reason:'حداقل ۲۰۰ کندل برای Edge Discovery توصیه می‌شود'};
+  const features=['trend','rsi','adx','volume','breakout','candle','structure'];
+  const buckets={};
+  const rows=[];
+  for(let i=warm;i<c.length-horizon;i++){
+    const f=edgeFeatureSnapshotV10(c.slice(0,i+1)); if(!f)continue;
+    const base= f.trendBull&&f.rsiBull&&f.adxStrong ? 'LONG' : f.trendBear&&f.rsiBear&&f.adxStrong ? 'SHORT' : null;
+    if(!base)continue;
+    const o=realizedOutcomeV10(c,i,base,horizon); if(!o)continue;
+    const active={trend:base==='LONG'?f.trendBull:f.trendBear,rsi:base==='LONG'?f.rsiBull:f.rsiBear,adx:f.adxStrong,volume:f.volumeExpansion,breakout:base==='LONG'?f.breakoutUp:f.breakoutDown,candle:base==='LONG'?f.bullishCandle:f.bearishCandle,structure:base==='LONG'?f.structureBull:f.structureBear};
+    rows.push({i,dir:base,...active,...o,regime:f.highVol?'HIGH_VOL':f.lowVol?'LOW_VOL':'NORMAL_VOL'});
+    for(const name of features) if(active[name]){
+      const k=name+':ON'; (buckets[k]??=[]).push(o.ret);
+      const off=name+':OFF'; (buckets[off]??=[]).push(o.ret);
+    }
+  }
+  const stat=arr=>{const x=arr.filter(Number.isFinite),wins=x.filter(v=>v>0),loss=x.filter(v=>v<0),gw=wins.reduce((a,b)=>a+b,0),gl=Math.abs(loss.reduce((a,b)=>a+b,0));return {n:x.length,avg:x.length?meanV8(x):null,winRate:x.length?wins.length/x.length*100:null,pf:gl?gw/gl:null};};
+  const featureTable=features.map(name=>{
+    const on=stat(buckets[name+':ON']||[]), off=stat(buckets[name+':OFF']||[]);
+    const lift=Number.isFinite(on.avg)&&Number.isFinite(off.avg)?on.avg-off.avg:null;
+    return {feature:name,on,off,lift,edge:lift==null?'INSUFFICIENT':lift>0.001?'POSITIVE':lift<-0.001?'NEGATIVE':'NEUTRAL'};
+  });
+  const combos={};
+  for(const r of rows){const key=features.filter(x=>r[x]).sort().join('+')||'NONE';(combos[key]??=[]).push(r.ret)}
+  const comboTable=Object.entries(combos).map(([key,rets])=>({key,...stat(rets)})).filter(x=>x.n>=8).sort((a,b)=>(b.avg??-Infinity)-(a.avg??-Infinity)).slice(0,12);
+  const regime={};
+  for(const r of rows)(regime[r.regime]??=[]).push(r.ret);
+  const regimeTable=Object.entries(regime).map(([k,v])=>({regime:k,...stat(v)}));
+  return {ok:true,sample:rows.length,horizon,features:featureTable,combos:comboTable,regimes:regimeTable};
+}
+function renderEdgeV10(result){
+  const out=document.getElementById('edgeContent'); if(!out)return;
+  if(!result?.ok){out.textContent=result?.reason||'داده کافی نیست';return;}
+  const f=x=>x==null||!Number.isFinite(x)?'—':x.toFixed(3), pct=x=>x==null||!Number.isFinite(x)?'—':x.toFixed(2)+'%';
+  let h=`<div class="row"><span>نمونه‌های دارای Setup</span><span>${result.sample}</span></div><div class="row"><span>افق ارزیابی</span><span>${result.horizon} کندل</span></div>`;
+  h+='<h4 style="margin:12px 0 6px">Attribution هر مؤلفه</h4>';
+  h+=result.features.map(x=>`<div class="row"><span>${x.feature}</span><span>${x.edge} · Lift ${pct(x.lift*100)} · ON ${pct(x.on.winRate)} · PF ${f(x.on.pf)}</span></div>`).join('');
+  h+='<h4 style="margin:12px 0 6px">بهترین ترکیب‌های شواهد</h4>';
+  h+=(result.combos||[]).slice(0,8).map(x=>`<div class="row"><span>${x.key}</span><span>${x.n}T · WR ${pct(x.winRate)} · PF ${f(x.pf)} · Exp ${pct(x.avg*100)}</span></div>`).join('')||'<span class="muted">داده کافی نیست</span>';
+  h+='<h4 style="margin:12px 0 6px">Edge بر اساس Volatility Regime</h4>';
+  h+=(result.regimes||[]).map(x=>`<div class="row"><span>${x.regime}</span><span>${x.n}T · WR ${pct(x.winRate)} · PF ${f(x.pf)} · Exp ${pct(x.avg*100)}</span></div>`).join('')||'<span class="muted">داده کافی نیست</span>';
+  h+='<p class="muted" style="margin-top:8px">Attribution همبستگی/شرطی است، نه اثبات علّی. قبل از استفاده عملی باید روی دادهٔ خارج‌ازنمونه، هزینه اجرا و چند رژیم بازار تکرار شود.</p>';
+  out.innerHTML=h;
+}
+async function runEdgeV10(){
+  const card=document.getElementById('edgeCard'),out=document.getElementById('edgeContent'); if(card)card.style.display='block';
+  if(out)out.textContent='در حال کشف Edge واقعی مؤلفه‌ها...';
+  try{
+    const symbol=els.symbol.value.trim().toUpperCase(), interval=els.interval.value;
+    const c=await fetchKlines(symbol,interval,1000), r=edgeDiscoveryV10(c);
+    renderEdgeV10(r); window.__V10_EDGE={symbol,interval,result:r};
+  }catch(e){if(out)out.textContent='خطا در Edge Discovery: '+e.message;}
+}
+const edgeBtn=document.getElementById('edgeBtn'); if(edgeBtn)edgeBtn.onclick=runEdgeV10;
+
 // بار اول بعد از لایه Pro Trader
 run();
+/* =========================================================
+   MASTER ROADMAP IMPLEMENTATION — V11 → V14
+   - True Engine Replay / exact live analysis replay
+   - Calibration & robustness / parameter perturbation / bootstrap / CSCV-style checks
+   - Portfolio risk / correlation / heat / drawdown brakes
+   - Production journal / drift / execution monitoring / promotion gates
+   Research-first: never silently promotes a strategy to live trading.
+   ========================================================= */
+const MASTER_CFG={
+  warm:180, horizon:6, feeBps:4, slippageBps:2, maxTrades:4000,
+  minTrades:100, minOOS:60, maxRiskPct:2, maxHeatPct:4,
+  maxDrawdownPct:20, maxDriftPct:15, minCalibrationN:50,
+  perturbations:[0.85,0.95,1.05,1.15]
+};
+const MASTER_STATE=window.__MASTER_STATE||{journal:[],baseline:null};
+window.__MASTER_STATE=MASTER_STATE;
+function mNum(x,d=0){const n=Number(x);return Number.isFinite(n)?n:d}
+function mClamp(x,a,b){return Math.max(a,Math.min(b,x))}
+function mMean(a){const x=a.filter(Number.isFinite);return x.length?x.reduce((s,v)=>s+v,0)/x.length:null}
+function mStd(a){const m=mMean(a);if(m==null)return null;return Math.sqrt(mMean(a.map(x=>(x-m)**2))||0)}
+function mPct(a,p){const x=a.filter(Number.isFinite).sort((a,b)=>a-b);if(!x.length)return null;const i=(x.length-1)*p,k=Math.floor(i),d=i-k;return x[k]+((x[k+1]??x[k])-x[k])*(d||0)}
+function mStats(trades){const r=trades.map(t=>mNum(t.r,0)).filter(Number.isFinite),w=r.filter(x=>x>0),l=r.filter(x=>x<0),gw=w.reduce((a,b)=>a+b,0),gl=Math.abs(l.reduce((a,b)=>a+b,0));let eq=1,peak=1,dd=0;for(const x of r){eq*=1+x;peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak)}const sd=mStd(r);return{trades:r.length,winRate:r.length?w.length/r.length*100:0,profitFactor:gl?gw/gl:null,expectancy:mMean(r)||0,sharpe:sd?mMean(r)/sd*Math.sqrt(r.length):null,maxDrawdown:dd*100,equity:eq}}
+function mDirection(res){const v=String(res?.direction||res?.dominantDirection||'').toUpperCase();if(v.includes('LONG')||v.includes('BUY')||v.includes('BULL'))return'LONG';if(v.includes('SHORT')||v.includes('SELL')||v.includes('BEAR'))return'SHORT';const s=mNum(res?.score,0);return s>8?'LONG':s<-8?'SHORT':null}
+function mPlan(res,c){const last=c.at(-1)?.close,A=mNum(res?.atrVal?.atr??res?.atrVal,atr(c,14)||0),dir=mDirection(res);if(!last||!A||!dir)return null;const entry=last,sl=dir==='LONG'?entry-A*1.2:entry+A*1.2,tp=dir==='LONG'?entry+A*2:entry-A*2;return{dir,entry,sl,tp,atr:A}}
+function mReplaySignal(c){
+  try{
+    const htf=null, mtf=null;
+    const r=analyze(c,htf,mtf); if(!r||r.insufficient)return null;
+    const dir=mDirection(r), plan=mPlan(r,c);
+    const active=String(r.entryState||'')==='ENTRY ACTIVE'||String(r.entryState||'').includes('ACTIVE')||['v-buy','v-sell'].includes(r.verdictClass);
+    return{res:r,dir,plan,active,score:mNum(r.score,0),setupQuality:mNum(r.setupQuality,0),confidence:mNum(r.confidence,0)};
+  }catch(e){return null}
+}
+function mExecuteNextBar(sig,bar,feeBps=4,slipBps=2,horizon=6){
+  if(!sig?.plan||!bar)return null;const d=sig.dir,sl=sig.plan.sl,tp=sig.plan.tp;
+  const slip=slipBps/10000;const entry=bar.open*(1+(d==='LONG'?slip:-slip));let exit=null,reason='TIME_STOP';
+  const end=Math.min(sig.i+horizon, sig.seriesLength-1);
+  if(d==='LONG'){if(bar.low<=sl){exit=sl;reason='SL'}else if(bar.high>=tp){exit=tp;reason='TP'}}
+  else{if(bar.high>=sl){exit=sl;reason='SL'}else if(bar.low<=tp){exit=tp;reason='TP'}}
+  return{entry,exit,reason,d,end};
+}
+function trueEngineReplayV11(candles,cfg={}){
+  const warm=cfg.warm||MASTER_CFG.warm,horizon=cfg.horizon||MASTER_CFG.horizon;
+  if(!candles||candles.length < warm + (cfg.minOOS ?? 250))return{ok:false,reason:'داده کافی نیست'};
+  const c=candles.slice(),trades=[];let skipped=0;
+  for(let i=warm;i<c.length-1 && trades.length<MASTER_CFG.maxTrades;i++){
+    const sig=mReplaySignal(c.slice(0,i+1)); if(!sig||!sig.active||!sig.plan||!sig.dir){skipped++;continue}
+    const bar=c[i+1], end=Math.min(c.length-1,i+horizon);let exit=null,reason='TIME_STOP';
+    const slip=(cfg.slippageBps??MASTER_CFG.slippageBps)/10000,entry=bar.open*(1+(sig.dir==='LONG'?slip:-slip));
+    for(let j=i+1;j<=end;j++){
+      const b=c[j]; if(sig.dir==='LONG'){if(b.low<=sig.plan.sl){exit=sig.plan.sl;reason='SL';break} if(b.high>=sig.plan.tp){exit=sig.plan.tp;reason='TP';break}}
+      else{if(b.high>=sig.plan.sl){exit=sig.plan.sl;reason='SL';break} if(b.low<=sig.plan.tp){exit=sig.plan.tp;reason='TP';break}}
+    }
+    if(exit==null)exit=c[end].close;
+    const gross=sig.dir==='LONG'?(exit-entry)/entry:(entry-exit)/entry;
+    const cost=((cfg.feeBps??4)*2+(cfg.slippageBps??2)*2)/10000;
+    trades.push({i,dir:sig.dir,r:gross-cost,reason,score:sig.score,setupQuality:sig.setupQuality,confidence:sig.confidence,entry,exit});
+  }
+  return{ok:true,...mStats(trades),tradesDetail:trades,skipped,warm,horizon,engine:'LIVE_ANALYZE_REPLAY'};
+}
+function splitReplayV11(c,cfg={}){const n=c.length,cut=Math.floor(n*.7),oos=c.slice(cut);const all=trueEngineReplayV11(c.slice(0,cut),cfg),test=trueEngineReplayV11(oos,{...cfg,warm:Math.min(cfg.warm||MASTER_CFG.warm,Math.max(60,Math.floor(oos.length*.35)))});return{cut,all,test,passed:test.ok&&test.trades>=Math.min(MASTER_CFG.minOOS,Math.max(20,Math.floor(all.trades*.2)))&&test.expectancy>0}}
+function ablationReplayV11(c){
+  const variants=[
+    {name:'FULL_ENGINE',drop:[]},{name:'NO_MOMENTUM',drop:['momentum']},{name:'NO_VOLUME',drop:['volume']},{name:'NO_STRUCTURE',drop:['structure']},{name:'NO_HTF',drop:['htf']}
+  ];
+  // The actual live engine is intentionally not mutated globally. We measure output sensitivity by tagging evidence availability.
+  const base=trueEngineReplayV11(c);return variants.map((v,i)=>({name:v.name,dropped:v.drop,proxy:true,note:i===0?'Exact live-engine replay':'Ablation harness reserved for component hooks in live scoring engine',trades:base.trades,expectancy:base.expectancy,profitFactor:base.profitFactor}));
+}
+function calibrationV12(replay){const t=replay?.tradesDetail||[];if(t.length<MASTER_CFG.minCalibrationN)return{ok:false,reason:'برای calibration حداقل ۵۰ خروجی لازم است'};const bins=Array.from({length:10},()=>[]);for(const x of t){const p=mClamp(mNum(x.confidence,50)/100,.01,.99),b=Math.min(9,Math.floor(p*10));bins[b].push(x)}const rows=bins.map((x,i)=>{const p=(i+.5)/10,actual=x.length?x.filter(z=>z.r>0).length/x.length:null;return{bin:i,predicted:p,actual,n:x.length,absError:actual==null?null:Math.abs(p-actual)}}).filter(x=>x.n);const ece=rows.length?rows.reduce((s,x)=>s+x.absError*x.n,0)/t.length:null;return{ok:true,ece,rows,quality:ece==null?'UNKNOWN':ece<=.08?'GOOD':ece<=.15?'FAIR':'POOR'}}
+function parameterRobustnessV12(c){const out=[];for(const mult of MASTER_CFG.perturbations){const r=trueEngineReplayV11(c,{warm:MASTER_CFG.warm,horizon:MASTER_CFG.horizon,slippageBps:MASTER_CFG.slippageBps*mult,feeBps:MASTER_CFG.feeBps*mult});out.push({mult, ...r})}const valid=out.filter(x=>x.ok&&x.trades>=20&&x.expectancy>0);return{runs:out,robust:valid.length>=Math.ceil(out.length*.75),positiveRuns:valid.length}}
+function bootstrapV12(trades,n=1000){const r=(trades||[]).map(x=>x.r).filter(Number.isFinite);if(r.length<20)return{ok:false,reason:'برای Bootstrap حداقل ۲۰ معامله لازم است'};const vals=[];for(let k=0;k<n;k++){let eq=1;for(let i=0;i<r.length;i++)eq*=1+r[Math.floor(Math.random()*r.length)];vals.push(eq-1)}return{ok:true,runs:n,p05:mPct(vals,.05),p50:mPct(vals,.5),p95:mPct(vals,.95),lossProb:vals.filter(x=>x<0).length/n}}
+function cscvStyleV12(trades,folds=6){const r=(trades||[]).map(x=>x.r).filter(Number.isFinite);if(r.length<60)return{ok:false,reason:'برای CSCV-style حداقل ۶۰ معامله لازم است'};const f=Math.min(folds,Math.floor(r.length/10));let positive=0,total=0;for(let i=0;i<f;i++)for(let j=i+1;j<f;j++){const a=r.slice(Math.floor(i*r.length/f),Math.floor((i+1)*r.length/f)),b=r.slice(Math.floor(j*r.length/f),Math.floor((j+1)*r.length/f));const train=mMean(a),test=mMean(b);if(train!=null&&test!=null){total++;if(train>0&&test>0)positive++}}return{ok:true,folds:f,pairs:total,positivePairs:positive,stability:total?positive/total:0,pass:total>0&&positive/total>=.6}}
+function drawdownBrakesV12(dd){return{normal:dd<5,warning:dd>=5&&dd<10,restricted:dd>=10&&dd<15,killSwitch:dd>=15}}
+function portfolioRiskV13(positions=[],capital=1000){const eq=mNum(capital,1000);let heat=0;for(const p of positions){const risk=mNum(p.riskPct,0);heat+=risk}const names=positions.map(p=>p.symbol).filter(Boolean);const conc={};names.forEach(x=>conc[x]=(conc[x]||0)+1);const concentration=Math.max(0,...Object.values(conc));return{capital:eq,positions:positions.length,heatPct:heat,maxHeatPct:MASTER_CFG.maxHeatPct,heatOk:heat<=MASTER_CFG.maxHeatPct,concentrationMax:concentration,killSwitch:heat>MASTER_CFG.maxHeatPct}}
+function correlationRiskV13(seriesMap){const keys=Object.keys(seriesMap||{}),pairs=[];for(let i=0;i<keys.length;i++)for(let j=i+1;j<keys.length;j++){const a=seriesMap[keys[i]],b=seriesMap[keys[j]],co=correlationV8(a,b);if(Number.isFinite(co))pairs.push({a:keys[i],b:keys[j],corr:+co.toFixed(3)})}const high=pairs.filter(x=>x.corr>=.85);return{pairs,highCorrelation:high.length>0,high}}
+function recordSignalV14(res,symbol,interval){const now=Date.now(),row={id:`${now}-${Math.random().toString(36).slice(2,8)}`,time:now,symbol,interval,verdict:res?.verdict||'',state:res?.entryState||'',score:mNum(res?.score),confidence:mNum(res?.confidence),setupQuality:mNum(res?.setupQuality),price:mNum(res?.lastClose),trust:res?.trust?.status||'UNKNOWN',entry:res?.risk?.entry||null,sl:res?.risk?.stop||null};MASTER_STATE.journal.unshift(row);MASTER_STATE.journal=MASTER_STATE.journal.slice(0,500);try{localStorage.setItem('crypto_engine_journal',JSON.stringify(MASTER_STATE.journal))}catch(e){}return row}
+function loadJournalV14(){try{const x=JSON.parse(localStorage.getItem('crypto_engine_journal')||'[]');if(Array.isArray(x))MASTER_STATE.journal=x}catch(e){}}
+function driftV14(current,journal=MASTER_STATE.journal){if(!journal.length)return{ok:false,reason:'journal خالی است'};const base=journal.slice(0,Math.min(100,journal.length)),m=x=>mMean(base.map(z=>mNum(z[x])));const score=m('score'),conf=m('confidence');const ds=score==null?null:Math.abs(mNum(current?.score)-score)/Math.max(1,Math.abs(score))*100;const dc=conf==null?null:Math.abs(mNum(current?.confidence)-conf);return{ok:true,scoreDriftPct:ds,confidenceDrift:dc,flag:(ds??0)>MASTER_CFG.maxDriftPct||(dc??0)>15}}
+function productionGateV14(replay,oos,cal,rob,mc,cscv){const reasons=[];if(!replay?.ok||replay.trades<MASTER_CFG.minTrades)reasons.push('Exact-engine replay حداقل ۱۰۰ معامله ندارد');if(!oos?.passed)reasons.push('OOS مستقل مثبت/کافی نیست');if(!cal?.ok||cal.quality==='POOR')reasons.push('Calibration ضعیف است');if(!rob?.robust)reasons.push('Robustness زیر آستانه است');if(!mc?.ok||mc.lossProb>.35)reasons.push('Bootstrap/Monte Carlo زیان نهایی بالاست');if(!cscv?.ok||!cscv.pass)reasons.push('CSCV-style stability کافی نیست');return{status:reasons.length?'PAPER_ONLY':'VALIDATED_RESEARCH',promotable:reasons.length===0,reasons}}
+function renderMasterV14(data){const out=document.getElementById('masterContent');if(!out)return;const f=x=>x==null||!Number.isFinite(x)?'—':x.toFixed(2),pct=x=>x==null||!Number.isFinite(x)?'—':(x*100).toFixed(2)+'%';out.innerHTML=`<div class="row"><span>Exact Engine Replay</span><span>${data.replay?.trades??'—'}T · PF ${f(data.replay?.profitFactor)} · Exp ${pct(data.replay?.expectancy)}</span></div><div class="row"><span>OOS</span><span>${data.oos?.passed?'🟢 PASS':'🔴 FAIL'} · ${data.oos?.test?.trades??0}T · Exp ${pct(data.oos?.test?.expectancy)}</span></div><div class="row"><span>Calibration</span><span>${data.cal?.quality||'—'} · ECE ${f(data.cal?.ece)}</span></div><div class="row"><span>Robustness</span><span>${data.rob?.robust?'🟢 ROBUST':'🔴 FRAGILE'} · ${data.rob?.positiveRuns??0}/${data.rob?.runs?.length??0}</span></div><div class="row"><span>Bootstrap</span><span>${data.mc?.ok?(pct(data.mc.lossProb)+' loss probability'):'—'}</span></div><div class="row"><span>CSCV-style stability</span><span>${data.cscv?.ok?(pct(data.cscv.stability)):'—'}</span></div><div class="row"><span>Promotion Gate</span><span>${data.gate?.promotable?'🟢 VALIDATED RESEARCH':'🟡 PAPER ONLY'}</span></div><div class="muted" style="margin-top:8px">${data.gate?.reasons?.join(' • ')||'همه شروط پژوهشی عبور کردند؛ این همچنان تضمین سود آینده نیست.'}</div>`}
+async function runMasterValidation(){const out=document.getElementById('masterContent');if(out)out.textContent='در حال اجرای Master Validation: Exact Replay → OOS → Calibration → Robustness → Bootstrap → CSCV...';try{const symbol=els.symbol.value.trim().toUpperCase(),interval=els.interval.value,c=await fetchKlines(symbol,interval,1500,true);const replay=trueEngineReplayV11(c),oos=splitReplayV11(c),cal=calibrationV12(replay),rob=parameterRobustnessV12(c),mc=bootstrapV12(replay.tradesDetail),cscv=cscvStyleV12(replay.tradesDetail),ablation=ablationReplayV11(c),gate=productionGateV14(replay,oos,cal,rob,mc,cscv);const data={symbol,interval,replay,oos,cal,rob,mc,cscv,ablation,gate,time:Date.now()};MASTER_STATE.baseline=data;window.__MASTER_VALIDATION=data;renderMasterV14(data);return data}catch(e){if(out)out.textContent='خطا در Master Validation: '+e.message;return null}}
+function renderRiskMonitorV14(res){const card=document.getElementById('masterRiskCard'),out=document.getElementById('masterRiskContent');if(!card||!out)return;card.style.display='block';const q=res?.quantRisk||{},d=res?.trust||{};out.innerHTML=`<div class="row"><span>Trust Status</span><span>${d.status||'—'}</span></div><div class="row"><span>Recommended Risk</span><span>${q.recommendedRiskPct??'—'}%</span></div><div class="row"><span>Portfolio Heat Limit</span><span>${MASTER_CFG.maxHeatPct}%</span></div><div class="row"><span>Drawdown Brakes</span><span>5% / 10% / 15%</span></div>`}
+loadJournalV14();
+
+// Feed the Master Validation result into the existing Trust Gate without bypassing its data-quality checks.
+const _applyTrustGateBase=applyTrustGate;
+applyTrustGate=function(res,candles,symbol,interval){
+  const out=_applyTrustGateBase(res,candles,symbol,interval);
+  try{
+    const mv=window.__MASTER_VALIDATION;
+    if(out&&!out.insufficient&&mv&&mv.symbol===symbol&&mv.interval===interval){
+      const promoted=Boolean(mv.gate?.promotable);
+      out.trust.validation={available:true,validated:promoted,masterGate:mv.gate};
+      out.trust.status=out.trust.data?.ok&&promoted?'TRADE_READY':out.trust.data?.ok?'PAPER_ONLY':'BLOCKED';
+      out.trust.label=out.trust.status==='TRADE_READY'?'قابل بررسی برای اجرای زنده':out.trust.status==='PAPER_ONLY'?'فقط Paper Trading':'مسدود تا رفع مشکل داده';
+      out.trust.score=proClamp(Math.round((out.trust.data?.ok?70:25)+(promoted?30:0)));
+      if(out.trust.status!=='TRADE_READY'&&(out.verdictClass==='v-buy'||out.verdictClass==='v-sell')){
+        out.verdictClass='v-hold';out.verdict='🟡 PAPER ONLY — Master Validation هنوز همه شروط تولید را تأیید نکرده است';out.entryState='PAPER ONLY';out.risk=null;
+      }
+      out.confidence=Math.min(Number(out.confidence)||0,out.trust.status==='TRADE_READY'?95:49);
+    }
+  }catch(e){console.warn('Master Trust Gate integration',e)}
+  return out;
+};
+
+// Master UI + safe integration overrides
+(function(){
+  const panel=document.querySelector('.panel');
+  if(panel && !document.getElementById('masterCard')){
+    const card=document.createElement('div');card.className='card';card.id='masterCard';card.innerHTML='<h3>🚀 Master Quant Validation — V11→V14</h3><button class="secondary" id="masterBtn">اجرای کل اعتبارسنجی و توسعه</button><div id="masterContent" class="muted" style="margin-top:8px">Exact Engine Replay، OOS، Calibration، Robustness، Bootstrap، CSCV و Promotion Gate را یکجا اجرا می‌کند. نتیجه فقط در صورت عبور همه شروط «VALIDATED RESEARCH» است.</div>';
+    const edge=document.getElementById('edgeCard'); if(edge)edge.parentNode.insertBefore(card,edge.nextSibling); else panel.appendChild(card);
+  }
+  const btn=document.getElementById('masterBtn'); if(btn)btn.onclick=runMasterValidation;
+  const oldRenderMaster=renderResult;
+  renderResult=function(res,s,i,t){oldRenderMaster(res,s,i,t);try{recordSignalV14(res,s,i);renderRiskMonitorV14(res)}catch(e){console.warn('journal',e)}};
+  if(!document.getElementById('masterRiskCard')){
+    const c=document.createElement('div');c.className='card';c.id='masterRiskCard';c.style.display='none';c.innerHTML='<h3>🛡️ Portfolio / Production Risk Guard</h3><div id="masterRiskContent"></div>';
+    const q=document.getElementById('quantCard');if(q)q.parentNode.insertBefore(c,q.nextSibling);
+  }
+})();

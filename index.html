@@ -87,6 +87,18 @@
   .pro-decision{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:7px;padding:7px 9px;border-radius:8px;background:#0b1117;border:1px solid var(--border)}
   .pro-decision .label{color:#7f8b99;font-size:10px}.pro-decision .value{font-weight:800;font-size:12px}
 
+  /* Trust / validation */
+  #trustCard{border-color:#2f3946}
+  .trust-status{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 9px;border-radius:8px;border:1px solid var(--border);font-size:11px;font-weight:700}
+  .trust-status b{font-size:12px;direction:ltr}
+  .trust-ok{background:rgba(49,196,157,.08);color:#b9e9dc;border-color:rgba(49,196,157,.30)}
+  .trust-warn{background:rgba(226,185,79,.08);color:#ead9a2;border-color:rgba(226,185,79,.28)}
+  .trust-block{background:rgba(240,107,104,.07);color:#efb0ae;border-color:rgba(240,107,104,.28)}
+  .trust-checks{display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;margin-top:7px}
+  .trust-checks div{font-size:10px;color:#9da8b5;line-height:1.5}
+  .trust-checks span{display:inline-block;width:15px;font-weight:800}
+  .trust-note{margin-top:7px;padding:7px 8px;border:1px dashed var(--border);border-radius:7px;color:#aeb8c4;font-size:10px;line-height:1.7}
+
   /* Scanner */
   #scannerOverlay{backdrop-filter:blur(4px);background:rgba(3,6,10,.72)!important;padding:18px!important}
   #scannerOverlay>div{max-width:700px!important;border-radius:12px!important;padding:13px!important;box-shadow:var(--shadow)}
@@ -126,6 +138,9 @@
     .card{padding:10px;margin-bottom:8px}
     .pro-grid{grid-template-columns:1fr 1fr}
   }
+
+  #evidenceCard{border-color:#303846;background:linear-gradient(180deg,#0e1117,#111722)}
+  #evidenceCard h3{color:#b7c1cf}
 </style>
 </head>
 <body>
@@ -240,9 +255,38 @@
       <div id="paPatterns"></div>
     </div>
 
+    <div class="card" id="candleCard" style="display:none">
+      <h3>🕯️ تحلیل کندل و اثر احتمالی بر موج بعدی</h3>
+      <div id="candleContent"></div>
+    </div>
+
     <div class="card" id="waveCard" style="display:none">
       <h3>موتور قدرت موج و فشار شکست (Wave Strength Engine)</h3>
       <div id="waveContent"></div>
+    </div>
+
+    <div class="card" id="quantCard" style="display:none">
+      <h3>🧪 Quant / Market Context V8</h3>
+      <div class="row"><span>رژیم بازار</span><span id="q_regime">—</span></div>
+      <div class="row"><span>ATR Volatility</span><span id="q_vol">—</span></div>
+      <div class="row"><span>Breakout Quality</span><span id="q_breakout">—</span></div>
+      <div class="row"><span>Fakeout Risk</span><span id="q_fakeout">—</span></div>
+      <div class="row"><span>Evidence Agreement / Uncertainty</span><span id="q_uncertainty">—</span></div>
+      <div class="row"><span>هزینه تخمینی رفت‌وبرگشت</span><span id="q_cost">—</span></div>
+      <div class="row"><span>ریسک پیشنهادی پس از فیلترها</span><span id="q_risk">—</span></div>
+      <p class="muted">این بخش کیفیت محیط معامله، هزینه اجرا و عدم‌قطعیت را به تحلیل اضافه می‌کند؛ هیچ‌کدام احتمال برد تضمین‌شده نیستند.</p>
+    </div>
+
+    <div class="card" id="researchCard" style="display:none">
+      <h3>🏛️ Institutional Validation Lab — Backtest / OOS / Monte Carlo</h3>
+      <button class="secondary" id="backtestBtn">اجرای اعتبارسنجی کامل</button>
+      <div id="researchContent" class="muted" style="margin-top:8px">این آزمایش شامل Backtest، Walk-Forward، Monte Carlo، Regime Breakdown و Cost Sensitivity است. تا زمانی که Gate معتبر نشود، Trade Ready فعال نمی‌شود.</div>
+    </div>
+
+    <div class="card" id="edgeCard" style="display:none">
+      <h3>🧬 V10 Edge Discovery / Strategy Attribution</h3>
+      <button class="secondary" id="edgeBtn">کشف Edge واقعی مؤلفه‌ها</button>
+      <div id="edgeContent" class="muted" style="margin-top:8px">این آزمایش بررسی می‌کند کدام شواهد و ترکیب‌ها واقعاً با Expectancy مثبت همراه بوده‌اند.</div>
     </div>
 
     <div class="card" id="reasonCard" style="display:none">
@@ -255,10 +299,10 @@
       <div id="aiText" class="loading">در حال دریافت...</div>
     </div>
 
-    <p class="muted">⚠ این ابزار صرفاً جهت تحلیل و آموزش است و توصیه مالی محسوب نمی‌شود. اگر داده کافی/کیفیت مناسب نباشد، سیستم به‌جای حدس زدن اعلام «عدم قطعیت» می‌کند.</p>
+    <p class="muted">⚠ این ابزار صرفاً جهت تحلیل و آموزش است و توصیه مالی محسوب نمی‌شود. امتیاز و Confidence احتمال برد تضمین‌شده نیستند. تا زمانی که بک‌تست و Walk-Forward خارج‌ازنمونه داخل سیستم ثبت و تأیید نشده باشد، سیگنال‌ها فقط برای Paper Trading هستند.</p>
   </div>
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
-<script src="app.js?v=protrader20260909ui"></script></body>
+<script src="app.js?v=master-v14-20260909"></script></body>
 </html>

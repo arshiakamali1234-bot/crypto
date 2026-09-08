@@ -16,6 +16,10 @@ const els = {
   aiProvider: document.getElementById('aiProvider'),
   apiKey: document.getElementById('apiKey'),
   verdictBox: document.getElementById('verdictBox'),
+  scanBtn: document.getElementById('scanBtn'),
+  scanCloseBtn: document.getElementById('scanCloseBtn'),
+  scannerOverlay: document.getElementById('scannerOverlay'),
+  scannerBody: document.getElementById('scannerBody'),
 };
 
 const INTERVAL_MAP_TV = { '1m':'1','5m':'5','15m':'15','30m':'30','1h':'60','4h':'240','1d':'D','1w':'W' };
@@ -1014,6 +1018,136 @@ ${JSON.stringify(dataSummary)}`;
     aiText.textContent = 'خطا در دریافت پاسخ از AI: ' + e.message;
   }
 }
+
+// =========================================================
+// ---------- اسکنر بازار (Section 2-4، 20-22، 29-31 چارچوب کاربر) ----------
+// اسکن Top USDT pairs بایننس، فیلتر نقدشوندگی، فیلتر BTC، رتبه‌بندی بهترین Setupهای Long/Short
+// =========================================================
+const LEVERAGED_RE = /(UP|DOWN|BULL|BEAR)USDT$/i;
+const STABLE_QUOTE_RE = /^(USDC|BUSD|TUSD|FDUSD|DAI)USDT$/i;
+
+async function fetchTop24hTickers(limit=30){
+  const res = await fetch('https://api.binance.com/api/v3/ticker/24hr');
+  if(!res.ok) throw new Error('عدم دسترسی به داده ۲۴ساعتهٔ بایننس');
+  const all = await res.json();
+  return all
+    .filter(t => t.symbol.endsWith('USDT') && !LEVERAGED_RE.test(t.symbol) && !STABLE_QUOTE_RE.test(t.symbol))
+    .map(t => ({ symbol:t.symbol, quoteVolume:+t.quoteVolume, priceChangePercent:+t.priceChangePercent, lastPrice:+t.lastPrice }))
+    .filter(t => t.quoteVolume > 0)
+    .sort((a,b)=>b.quoteVolume-a.quoteVolume)
+    .slice(0, limit);
+}
+
+// فیلتر BTC (SECTION 4) — بایاس کلی بازار، هرگز به‌تنهایی BUY/SELL نمی‌سازد فقط وزن می‌دهد
+async function getBTCBias(){
+  try{
+    const c1h = await fetchKlines('BTCUSDT','1h',150);
+    const c4h = await fetchKlines('BTCUSDT','4h',150);
+    const snap1h = quickTrendSnapshot(c1h);
+    const snap4h = quickTrendSnapshot(c4h);
+    let bias = 'مختلط/نامشخص';
+    if(snap4h.trend==='صعودی' && snap1h.trend!=='نزولی') bias = 'صعودی';
+    else if(snap4h.trend==='نزولی' && snap1h.trend!=='صعودی') bias = 'نزولی';
+    return { bias, snap1h, snap4h };
+  }catch(e){ return { bias:'نامشخص (خطا در دریافت)', snap1h:{available:false}, snap4h:{available:false} }; }
+}
+
+// فیلتر اول سریع (SECTION 3) روی تایم‌فریم ۱ساعته برای همهٔ کاندیدها، بدون تحلیل عمیق
+async function quickFilterCandidates(tickers){
+  const results = await Promise.all(tickers.map(async t=>{
+    try{
+      const candles = await fetchKlines(t.symbol, '1h', 120);
+      const snap = quickTrendSnapshot(candles);
+      if(!snap.available) return null;
+      let momentum = 0;
+      if(snap.rsi!=null){ if(snap.rsi>52 && snap.rsi<75) momentum+=1; if(snap.rsi<48 && snap.rsi>25) momentum-=1; }
+      if(snap.trend==='صعودی') momentum += 1;
+      if(snap.trend==='نزولی') momentum -= 1;
+      if(snap.bos && snap.bos.includes('صعودی')) momentum += 1;
+      if(snap.bos && snap.bos.includes('نزولی')) momentum -= 1;
+      return { ...t, snap, momentum };
+    }catch(e){ return null; }
+  }));
+  return results.filter(Boolean);
+}
+
+async function deepAnalyzeSymbol(symbol, workingTf='1h', htfTf='4h'){
+  try{
+    const candles = await fetchKlines(symbol, workingTf, 300);
+    const htfCandles = await fetchKlines(symbol, htfTf, 150);
+    const res = analyze(candles, htfCandles);
+    if(res.insufficient) return null;
+    return { symbol, workingTf, ...res };
+  }catch(e){ return null; }
+}
+
+function scannerCardHTML(item, kind){
+  const dirTag = kind==='long' ? '🟢 LONG' : kind==='short' ? '🔴 SHORT' : '🟡 WATCH';
+  const plan = kind==='long' ? (item.risk?.direction==='LONG'?item.risk:item.watchLong) : kind==='short' ? (item.risk?.direction==='SHORT'?item.risk:item.watchShort) : (item.watchLong||item.watchShort);
+  const planLine = plan ? `Entry: ${plan.entry.toFixed(4)} | SL: ${plan.stopLoss.toFixed(4)} | TP1: ${plan.takeProfit1.toFixed(4)} | TP2: ${plan.takeProfit2.toFixed(4)} | TP3: ${plan.takeProfit3.toFixed(4)}` : 'داده کافی برای ستاپ عددی نیست';
+  const patternLine = item.chartPattern ? item.chartPattern.type : (item.patterns?.length ? item.patterns.map(p=>p.name).join('، ') : '—');
+  return `<div class="card" style="margin-bottom:8px">
+    <div class="row" style="border:none"><b>${item.symbol.replace('USDT','/USDT')}</b><span>${dirTag}</span></div>
+    <div class="row"><span>امتیاز/اطمینان</span><span>${item.score} | ${item.confidence}%</span></div>
+    <div class="row"><span>وضعیت</span><span>${item.verdict}</span></div>
+    <div class="row"><span>الگو</span><span>${patternLine}</span></div>
+    <p class="muted" style="margin:6px 0 0">${planLine}</p>
+  </div>`;
+}
+
+async function runMarketScan(){
+  els.scannerOverlay.style.display='block';
+  els.scannerBody.innerHTML = '<div class="loading">در حال دریافت لیست بازار Binance...</div>';
+  try{
+    const btc = await getBTCBias();
+    els.scannerBody.innerHTML = `<div class="loading">بایاس BTC: ${btc.bias} — در حال اسکن نقدشونده‌ترین جفت‌ارزها (فیلتر اول)...</div>`;
+
+    const tickers = await fetchTop24hTickers(30);
+    const filtered = await quickFilterCandidates(tickers);
+
+    // انتخاب کاندیدهای دسته A برای تحلیل عمیق: قوی‌ترین مومنتوم صعودی و نزولی (هرکدام تا ۶ نماد)
+    const sortedUp = [...filtered].sort((a,b)=>b.momentum-a.momentum).slice(0,6);
+    const sortedDown = [...filtered].sort((a,b)=>a.momentum-b.momentum).slice(0,6);
+    const candidateSymbols = [...new Set([...sortedUp, ...sortedDown].map(c=>c.symbol))];
+
+    els.scannerBody.innerHTML = `<div class="loading">بایاس BTC: ${btc.bias} — در حال تحلیل عمیق ${candidateSymbols.length} کاندیدای دستهٔ A (ساختار بازار، پترن، ریسک)...</div>`;
+
+    const deep = (await Promise.all(candidateSymbols.map(s=>deepAnalyzeSymbol(s)))).filter(Boolean);
+
+    const longs = deep.filter(d=>d.verdictClass==='v-buy').sort((a,b)=>b.confidence-a.confidence).slice(0,5);
+    const shorts = deep.filter(d=>d.verdictClass==='v-sell').sort((a,b)=>b.confidence-a.confidence).slice(0,5);
+    const usedSymbols = new Set([...longs, ...shorts].map(d=>d.symbol));
+    const watchlist = deep
+      .filter(d=>!usedSymbols.has(d.symbol) && Math.abs(d.score)>=3 && (d.watchLong||d.watchShort))
+      .sort((a,b)=>b.confidence-a.confidence)
+      .slice(0,5);
+
+    let html = `<div class="row" style="border:none"><span>Market Risk</span><span>${btc.bias==='نزولی' ? '🔴 بالا (BTC نزولی — احتیاط در Long آلت‌کوین)' : btc.bias==='صعودی' ? '🟢 پایین‌تر (BTC صعودی)' : '🟡 متوسط (BTC نامشخص)'}</span></div>`;
+    html += `<div class="row"><span>BTC Bias (4H/1H)</span><span>${btc.bias}</span></div>`;
+    html += `<div class="row" style="margin-bottom:10px"><span>تعداد کاندیدای دستهٔ A بررسی‌شده</span><span>${candidateSymbols.length} از ${tickers.length} جفت‌ارز پرحجم</span></div>`;
+
+    html += '<h3 style="margin-top:14px">🟢 بهترین Setupهای LONG</h3>';
+    html += longs.length ? longs.map(x=>scannerCardHTML(x,'long')).join('') : '<p class="muted">هیچ ستاپ LONG قاطعی در این لحظه پیدا نشد.</p>';
+
+    html += '<h3 style="margin-top:14px">🔴 بهترین Setupهای SHORT</h3>';
+    html += shorts.length ? shorts.map(x=>scannerCardHTML(x,'short')).join('') : '<p class="muted">هیچ ستاپ SHORT قاطعی در این لحظه پیدا نشد.</p>';
+
+    html += '<h3 style="margin-top:14px">🟡 واچ‌لیست (در حال شکل‌گیری، هنوز Trigger نشده)</h3>';
+    html += watchlist.length ? watchlist.map(x=>scannerCardHTML(x,'watch')).join('') : '<p class="muted">موردی برای واچ‌لیست شناسایی نشد.</p>';
+
+    if(!longs.length && !shorts.length){
+      html += `<p class="muted" style="margin-top:10px">⚪ NO TRADE در سطح کل بازار — هیچ نمادی از میان ${tickers.length} جفت‌ارز پرحجم، تمام شرایط (ساختار بازار + سطح کلیدی + پرایس‌اکشن + تریگر + حجم + ریسک/ریوارد قابل‌قبول) را هم‌زمان نداشت. این پیام‌رسان جعلی سیگنال نمی‌سازد.</p>`;
+    }
+    html += `<p class="muted" style="margin-top:12px">⚠ این اسکن فقط روی تایم‌فریم ۱ساعته (تأیید ۴ساعته) و صرفاً بر مبنای نقدشونده‌ترین جفت‌ارزهای اسپات بایننس اجرا شده؛ آموزشی است و توصیهٔ مالی محسوب نمی‌شود.</p>`;
+
+    els.scannerBody.innerHTML = html;
+  }catch(e){
+    els.scannerBody.innerHTML = `<p class="muted">خطا در اسکن بازار: ${e.message}</p>`;
+  }
+}
+
+els.scanBtn.onclick = runMarketScan;
+els.scanCloseBtn.onclick = () => { els.scannerOverlay.style.display='none'; };
 
 // ---------- اجرای اصلی ----------
 async function run(){

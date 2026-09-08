@@ -137,14 +137,23 @@ async function drawAnalysisOnChart(res){
 }
 
 // ---------- دریافت داده خام از Binance ----------
-async function fetchKlines(symbol, interval, limit=300){
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${limit}`;
+async function fetchKlines(symbol, interval, limit=300, closedOnly=true){
+  // یک کندل اضافه می‌گیریم تا اگر آخرین کندل هنوز بسته نشده، بعد از حذفش هم به تعداد limit کندلِ بسته‌شده برسیم
+  const fetchLimit = closedOnly ? Math.min(limit+1, 1000) : limit;
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${fetchLimit}`;
   const res = await fetch(url);
   if(!res.ok) throw new Error('عدم دسترسی به داده بازار برای این نماد/تایم‌فریم');
   const raw = await res.json();
-  return raw.map(k => ({
-    time:k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]
+  let mapped = raw.map(k => ({
+    time:k[0], closeTime:k[6], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]
   }));
+  if(closedOnly && mapped.length){
+    // کندل آخر اگر هنوز بسته نشده (closeTime در آینده است) کنار گذاشته می‌شود
+    // تا سیگنال‌ها بر مبنای دادهٔ نیمه‌کاره و در حال تغییرِ کندل زنده نوسان نکنند
+    const now = Date.now();
+    if(mapped.at(-1).closeTime > now) mapped = mapped.slice(0, -1);
+  }
+  return mapped.slice(-limit);
 }
 
 // ---------- خلاصهٔ سریع روند برای هر تایم‌فریم (برای تحلیل چندتایم‌فریمی واقعی برای AI) ----------
@@ -764,13 +773,37 @@ function analyze(candles, htfCandles){
   };
 }
 
+// ---------- پایداری سیگنال بین رفرش‌ها (جلوگیری از تغییر مکرر سیگنال به‌خاطر نوسان کندل زنده) ----------
+// چون از این پس تحلیل فقط روی کندل‌های کاملاً بسته‌شده انجام می‌شود، بخش زیادی از تغییرات لحظه‌به‌لحظه
+// خودبه‌خود حذف می‌شود. این تابع فقط یک لایهٔ اضافه است: نشان می‌دهد سیگنال فعلی از چند کندل بستهٔ اخیر
+// پیوسته تکرار شده یا همین الان تغییر کرده (که باید با احتیاط بیشتری با آن برخورد شود).
+function trackSignalStability(symbol, interval, verdictClass, lastClosedTime){
+  const key = `sigHistory_${symbol}_${interval}`;
+  let history = [];
+  try{ history = JSON.parse(localStorage.getItem(key) || '[]'); }catch(e){ history = []; }
+  if(!lastClosedTime){
+    return { justChanged:false, stableCount:1 };
+  }
+  if(!history.length || history.at(-1).t !== lastClosedTime){
+    history.push({ t: lastClosedTime, v: verdictClass });
+    history = history.slice(-8);
+    try{ localStorage.setItem(key, JSON.stringify(history)); }catch(e){}
+  }
+  let stableCount = 0;
+  for(let i=history.length-1;i>=0;i--){
+    if(history[i].v === verdictClass) stableCount++; else break;
+  }
+  const prevDifferent = history.length>=2 && history.at(-2).v !== verdictClass;
+  return { justChanged: prevDifferent && stableCount===1, stableCount };
+}
+
 function label(scoreVal){
   if(scoreVal>0) return `<span class="tag tag-up">مثبت (+${scoreVal})</span>`;
   if(scoreVal<0) return `<span class="tag tag-down">منفی (${scoreVal})</span>`;
   return `<span class="tag tag-neu">خنثی (0)</span>`;
 }
 
-function renderResult(res, symbol, interval){
+function renderResult(res, symbol, interval, lastClosedTime){
   if(res.insufficient){
     els.verdictBox.className = 'verdict v-none';
     els.verdictBox.textContent = 'داده کافی برای تحلیل معتبر وجود ندارد (حداقل ۶۰ کندل لازم است). به‌جای حدس زدن، تحلیلی ارائه نمی‌شود.';
@@ -778,8 +811,17 @@ function renderResult(res, symbol, interval){
     return;
   }
 
+  const stability = trackSignalStability(symbol, interval, res.verdictClass, lastClosedTime);
   els.verdictBox.className = 'verdict ' + res.verdictClass;
-  els.verdictBox.innerHTML = res.verdict + `<br><span style="font-size:12px;font-weight:400">امتیاز: ${res.score} | سطح اطمینان: ${res.confidence}%</span>`;
+  let stabilityNote;
+  if(stability.justChanged){
+    stabilityNote = `⚠ سیگنال همین کندل بسته‌شدهٔ اخیر تغییر کرده — هنوز فقط ۱ کندل آن را تأیید می‌کند، برای اطمینان بیشتر منتظر تأیید کندل بعدی هم بمان.`;
+  } else if(stability.stableCount >= 2){
+    stabilityNote = `پایداری سیگنال: همین وضعیت در ${stability.stableCount} کندل بستهٔ اخیر پیوسته تکرار شده (نوسان کاذب کمتر).`;
+  } else {
+    stabilityNote = `این اولین بار است که این وضعیت روی این نماد/تایم‌فریم ثبت می‌شود.`;
+  }
+  els.verdictBox.innerHTML = res.verdict + `<br><span style="font-size:12px;font-weight:400">امتیاز: ${res.score} | سطح اطمینان: ${res.confidence}%</span><br><span style="font-size:11px;font-weight:400;opacity:.85">${stabilityNote}</span>`;
 
   document.getElementById('scoreCard').style.display='block';
   document.getElementById('s_trend').innerHTML = label(res.trendScore);
@@ -1166,7 +1208,7 @@ async function run(){
       try{ htfCandles = await fetchKlines(symbol, htfInterval, 250); }catch(e){ /* اختیاری است، اگر نشد بدون تأیید چندتایم‌فریمی ادامه می‌دهیم */ }
     }
     const res = analyze(candles, htfCandles);
-    renderResult(res, symbol, interval);
+    renderResult(res, symbol, interval, candles.at(-1)?.closeTime);
   }catch(e){
     els.verdictBox.className='verdict v-none';
     els.verdictBox.textContent = 'خطا: ' + e.message + ' — نماد را طبق فرمت Binance وارد کن (مثل BTCUSDT, ETHUSDT).';

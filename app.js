@@ -1037,6 +1037,7 @@ function renderResult(res, symbol, interval, lastClosedTime){
     els.verdictBox.className = 'verdict v-none';
     els.verdictBox.textContent = 'داده کافی برای تحلیل معتبر وجود ندارد (حداقل ۶۰ کندل لازم است). به‌جای حدس زدن، تحلیلی ارائه نمی‌شود.';
     ['qualityCard','scoreCard','srCard','indCard','paCard','waveCard','reasonCard','riskCard','aiCard'].forEach(id=>document.getElementById(id).style.display='none');
+    const stalePro=document.getElementById('proTraderCard'); if(stalePro) stalePro.remove();
     return;
   }
 
@@ -1071,16 +1072,18 @@ function renderResult(res, symbol, interval, lastClosedTime){
   const dirLabel=pro.direction==='LONG'?'🟢 LONG':pro.direction==='SHORT'?'🔴 SHORT':'⚪ NEUTRAL';
   proCard.innerHTML=`
     <h3>🧠 لایهٔ معامله‌گر حرفه‌ای</h3>
-    <div class="row"><span>رژیم بازار</span><span>${escapeHTML(reg.label||'نامشخص')}</span></div>
-    <div class="row"><span>کیفیت اجرا</span><span>${ex.score??'—'}/100</span></div>
-    <div class="row"><span>ریسک ترید</span><span>${rr.riskPct??'—'}% | ${rr.riskAmount??'—'} USDT</span></div>
-    <div class="row"><span>R:R معتبر</span><span>${rr.rr1??'—'} / ${rr.rr2??'—'} / ${rr.rr3??'—'}</span></div>
-    <div class="row"><span>Portfolio Heat</span><span>${rr.heat??'—'}% (حداکثر پیشنهادی ${rr.maxHeat??'—'}%)</span></div>
-    <div class="row"><span>Derivatives</span><span>${res.derivatives?.status==='ok'?`Funding ${fmt(res.derivatives.fundingRate*100,4)}% | OI ${fmt(res.derivatives.openInterest,0)}`:'داده در دسترس نیست'}</span></div>
-    <div class="row"><span>تصمیم</span><span>${escapeHTML(pro.action||dirLabel)}</span></div>
-    ${pro.reasons?.length?`<p class="muted"><b>چرا:</b> ${pro.reasons.map(escapeHTML).join(' • ')}</p>`:''}
-    ${pro.killers?.length?`<p class="muted"><b>Thesis Killers:</b> ${pro.killers.map(escapeHTML).join(' • ')}</p>`:''}
-    ${pro.executionPlan?.length?`<p class="muted"><b>قانون اجرا:</b> ${pro.executionPlan.map(escapeHTML).join(' • ')}</p>`:''}
+    <div class="pro-decision"><span class="label">تصمیم فعلی</span><span class="value">${escapeHTML(pro.action||dirLabel)}</span></div>
+    <div class="pro-grid">
+      <div class="pro-metric"><span class="k">رژیم بازار</span><span class="v">${escapeHTML(reg.label||'نامشخص')}</span></div>
+      <div class="pro-metric"><span class="k">کیفیت اجرا</span><span class="v">${ex.score??'—'}/100</span></div>
+      <div class="pro-metric"><span class="k">ریسک هر ترید</span><span class="v">${rr.riskPct??'—'}% · ${rr.riskAmount??'—'} USDT</span></div>
+      <div class="pro-metric"><span class="k">R:R</span><span class="v">${rr.rr1??'—'} / ${rr.rr2??'—'} / ${rr.rr3??'—'}</span></div>
+      <div class="pro-metric"><span class="k">Portfolio Heat</span><span class="v">${rr.heat??'—'}% / ${rr.maxHeat??'—'}%</span></div>
+      <div class="pro-metric"><span class="k">Derivatives</span><span class="v">${res.derivatives?.status==='ok'?`F ${fmt(res.derivatives.fundingRate*100,4)}% · OI ${fmt(res.derivatives.openInterest,0)}`:'Unavailable'}</span></div>
+    </div>
+    ${pro.reasons?.length?`<div class="pro-block"><b>دلایل:</b> ${pro.reasons.map(escapeHTML).join(' • ')}</div>`:''}
+    ${pro.killers?.length?`<div class="pro-block"><b>Thesis Killers:</b> ${pro.killers.map(escapeHTML).join(' • ')}</div>`:''}
+    ${pro.executionPlan?.length?`<div class="pro-block"><b>قوانین اجرا:</b> ${pro.executionPlan.map(escapeHTML).join(' • ')}</div>`:''}
   `;
   qualityCard?.insertAdjacentElement('afterend',proCard);
 
@@ -1450,8 +1453,8 @@ async function deepAnalyzeSymbol(symbol, workingTf='1h', htfTf='4h'){
     ]);
     let res=analyze(candles,htfCandles,mtfSnapshot);
     if(res.insufficient)return null;
-    res=applyProTraderLayer(res,candles,symbol,workingTf);
     res=await enrichCryptoDerivatives(res,symbol,workingTf);
+    res=applyProTraderLayer(res,candles,symbol,workingTf);
     return {symbol,workingTf,...res};
   }catch(e){return null;}
 }
@@ -1562,8 +1565,8 @@ async function run(){
     const mtfSnapshot = await buildCompactMTF(symbol, interval);
     let res = analyze(candles, htfCandles, mtfSnapshot);
     if(!res.insufficient){
-      res = applyProTraderLayer(res, candles, symbol, interval);
       res = await enrichCryptoDerivatives(res, symbol, interval);
+      res = applyProTraderLayer(res, candles, symbol, interval);
     }
     renderResult(res, symbol, interval, candles.at(-1)?.closeTime);
   }catch(e){

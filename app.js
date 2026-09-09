@@ -1692,6 +1692,7 @@ async function run(){
     }
     renderQuantV8(res);
     renderResult(res, symbol, interval, candles.at(-1)?.closeTime);
+    renderDecisionDetailsV27(res);
   }catch(e){
     els.verdictBox.className='verdict v-none';
     els.verdictBox.textContent = 'خطا: ' + e.message + ' — نماد را طبق فرمت Binance وارد کن (مثل BTCUSDT, ETHUSDT).';
@@ -2459,9 +2460,11 @@ async function runUltimate(){
   const symbol=els.symbol.value.trim().toUpperCase(), interval=els.interval.value; els.verdictBox.className='verdict v-none';els.verdictBox.textContent='در حال اجرای Ultimate Market Intelligence...';renderTVWidget(symbol,interval);
   try{
     const [candles,htfCandles,mtfSnapshot,ctx]=await Promise.all([fetchKlines(symbol,interval,300,true), (async()=>{const tf=HTF_MAP[interval];return tf?fetchKlines(symbol,tf,250,true):null})(), buildCompactMTF(symbol,interval), uFetchContext(interval)]);
-    let res=analyze(candles,htfCandles,mtfSnapshot); if(res.insufficient){renderResult(res,symbol,interval,candles.at(-1)?.closeTime);return}
+    let res=analyze(candles,htfCandles,mtfSnapshot); if(res.insufficient){renderResult(res,symbol,interval,candles.at(-1)?.closeTime);
+    renderDecisionDetailsV27(res);return}
     res=uApplyCrossAsset(res,ctx); res=await enrichCryptoDerivatives(res,symbol,interval); res=applyProTraderLayer(res,candles,symbol,interval); res=applyAdvancedQuantLayer(res,candles,symbol); res=applyTrustGate(res,candles,symbol,interval);
-    renderQuantV8(res);renderResult(res,symbol,interval,candles.at(-1)?.closeTime);uRenderCard(res);
+    renderQuantV8(res);renderResult(res,symbol,interval,candles.at(-1)?.closeTime);
+    renderDecisionDetailsV27(res);uRenderCard(res);
   }catch(e){els.verdictBox.className='verdict v-none';els.verdictBox.textContent='خطا در Ultimate Engine: '+e.message}
 }
 els.loadBtn.onclick=runUltimate;
@@ -2624,7 +2627,7 @@ function pCalibration(trades){const a=(trades||[]).map(t=>({p:mClamp(mNum(t.conf
 function pBootstrapCI(trades,runs=PRECISION_CFG.bootRuns,seed=20260909){const r=(trades||[]).map(t=>mNum(t.r,NaN)).filter(Number.isFinite);if(r.length<30)return{ok:false,reason:'حداقل ۳۰ معامله برای CI لازم است'};const rnd=pRand(seed),means=[],pfs=[];for(let k=0;k<runs;k++){const s=[];for(let i=0;i<r.length;i++)s.push(r[Math.floor(rnd()*r.length)]);means.push(mMean(s));const w=s.filter(x=>x>0).reduce((a,b)=>a+b,0),l=Math.abs(s.filter(x=>x<0).reduce((a,b)=>a+b,0));pfs.push(l?w/l:null)}return{ok:true,runs,expectancyCI:[pQuant(means,.025),pQuant(means,.975)],pfCI:[pQuant(pfs.filter(Number.isFinite),.025),pQuant(pfs.filter(Number.isFinite),.975)],probExpPositive:means.filter(x=>x>0).length/runs}}
 function pPermutationTest(trades,runs=PRECISION_CFG.permRuns,seed=271828){const r=(trades||[]).map(t=>mNum(t.r,NaN)).filter(Number.isFinite);if(r.length<30)return{ok:false,reason:'حداقل ۳۰ معامله برای آزمون لازم است'};const observed=mMean(r)||0,rnd=pRand(seed);let ge=0;for(let k=0;k<runs;k++){let s=0;for(const x of r)s+=(rnd()<.5?-x:x);if(Math.abs(s/r.length)>=Math.abs(observed))ge++}const p=(ge+1)/(runs+1);return{ok:true,observed,pValue:p,significant:p<PRECISION_CFG.minSignificance}}
 function pPurgedWalkForward(candles){const c=candles||[],folds=[];if(c.length<PRECISION_CFG.minTrain+PRECISION_CFG.minOOS*3)return{ok:false,reason:'داده کافی برای Purged Walk-Forward نیست'};const n=c.length,foldSize=Math.floor((n-PRECISION_CFG.minTrain)/4);for(let k=0;k<4;k++){const trainEnd=PRECISION_CFG.minTrain+k*foldSize;const testStart=trainEnd+PRECISION_CFG.purgeBars;const testEnd=Math.min(n,(k===3?n:testStart+foldSize));if(testEnd-testStart<PRECISION_CFG.minOOS)continue;const train=trueEngineReplayV11(c.slice(0,trainEnd),{warm:Math.min(MASTER_CFG.warm,Math.max(60,Math.floor(trainEnd*.35))),horizon:PRECISION_CFG.horizon});const test=trueEngineReplayV11(c.slice(testStart,testEnd),{warm:Math.min(MASTER_CFG.warm,Math.max(60,Math.floor((testEnd-testStart)*.35))),horizon:PRECISION_CFG.horizon});folds.push({fold:k+1,train:{trades:train.trades,expectancy:train.expectancy,pf:train.profitFactor},test:{trades:test.trades,expectancy:test.expectancy,pf:test.profitFactor}})}const valid=folds.filter(f=>f.test.trades>=PRECISION_CFG.minFoldTrades);const pos=valid.filter(f=>f.test.expectancy>PRECISION_CFG.minOOSExpectancy).length;return{ok:valid.length>=3,folds,validFolds:valid.length,positiveFolds:pos,positiveRate:valid.length?pos/valid.length:0,passed:valid.length>=3&&pos/valid.length>=PRECISION_CFG.minPositiveFolds}}
-function pAnomalyScan(candles){const c=candles||[];let bad=0,gaps=0,dupes=0,invalid=0;for(let i=0;i<c.length;i++){const x=c[i];if(!(Number.isFinite(x.open)&&Number.isFinite(x.high)&&Number.isFinite(x.low)&&Number.isFinite(x.close)&&Number.isFinite(x.volume))||x.high<x.low||x.high<Math.max(x.open,x.close)||x.low>Math.min(x.open,x.close))invalid++;if(i&&Number.isFinite(x.openTime)&&Number.isFinite(c[i-1].openTime)&&x.openTime<=c[i-1].openTime)dupes++;if(i&&Number.isFinite(x.openTime)&&Number.isFinite(c[i-1].openTime)){const dt=x.openTime-c[i-1].openTime;if(dt>0){const med=dt; if(dt>med*4)gaps++}}}bad=invalid+dupes+gaps;return{n:c.length,invalid,duplicates:dupes,gaps,anomalyRate:c.length?bad/c.length:1,ok:c.length>0&&bad/c.length<=PRECISION_CFG.maxAnomalyRate}}
+function pAnomalyScan(candles){const c=candles||[];let bad=0,gaps=0,dupes=0,invalid=0;for(let i=0;i<c.length;i++){const x=c[i];if(!(Number.isFinite(x.open)&&Number.isFinite(x.high)&&Number.isFinite(x.low)&&Number.isFinite(x.close)&&Number.isFinite(x.volume))||x.high<x.low||x.high<Math.max(x.open,x.close)||x.low>Math.min(x.open,x.close))invalid++;if(i&&Number.isFinite(x.time)&&Number.isFinite(c[i-1].time)&&x.time<=c[i-1].time)dupes++;if(i&&Number.isFinite(x.time)&&Number.isFinite(c[i-1].time)){const dt=x.time-c[i-1].time;if(dt>0){const med=dt; if(dt>med*4)gaps++}}}bad=invalid+dupes+gaps;return{n:c.length,invalid,duplicates:dupes,gaps,anomalyRate:c.length?bad/c.length:1,ok:c.length>0&&bad/c.length<=PRECISION_CFG.maxAnomalyRate}}
 function pEnsemble(res){if(!res||res.insufficient)return{status:'ABSTAIN'};const base=mNum(res.score,0),adaptive=mNum(res.adaptiveIntelligence?.scoreShift,0),agree=mNum(res.adaptiveIntelligence?.componentAgreement,50),cf=res.adaptiveIntelligence?.counterfactual?.robust!==false,adv=mNum(res.adaptiveIntelligence?.adversarial?.penalty,0);const adaptiveScore=base+adaptive;const disagreement=Math.abs(base-adaptiveScore);const confidence=mNum(res.confidence,0);const hardConflict=disagreement>PRECISION_CFG.maxScoreDisagreement||agree<35||!cf||adv>=14;let decision=base>=8?'LONG':base<=-8?'SHORT':'NEUTRAL';if(hardConflict||confidence<PRECISION_CFG.abstainConfidence)decision='ABSTAIN';const strength=mClamp((Math.abs(base)*.55+Math.abs(adaptive)*.45)*(agree/100)*(cf?1:.65)*(1-mClamp(adv/40,0,.7)),0,100);return{baseScore:base,adaptiveScore,disagreement,agreement:agree,counterfactualRobust:cf,adversarialPenalty:adv,decision,strength:+strength.toFixed(2),abstain:decision==='ABSTAIN',reason:hardConflict?'شواهد/مدل‌ها اختلاف یا عدم‌قطعیت بالا دارند':'توافق کافی بین لایه‌های مستقل'}}
 function pPrecisionGate(v){const r=[];if(!v?.replay||v.replay.trades<PRECISION_CFG.minTrades)r.push('نمونه معاملات کمتر از حداقل ۱۰۰');if(!v?.oos?.passed)r.push('OOS/Purged Walk-Forward مثبت نیست');if(!v?.cal?.ok||v.cal.ece>PRECISION_CFG.maxECE)r.push('Calibration ضعیف');if(!v?.ci?.ok||v.ci.probExpPositive<.80)r.push('Bootstrap CI: احتمال Expectancy مثبت کافی نیست');if(!v?.perm?.significant)r.push('آزمون permutation از Edge معنادار حمایت نمی‌کند');if(!v?.anomaly?.ok)r.push('کیفیت داده/Anomaly خارج از محدوده است');if(!v?.regime?.passed)r.push('پایداری بین foldها کافی نیست');return{status:r.length?'ABSTAIN/PAPER':'HIGH_CONFIDENCE_RESEARCH',pass:r.length===0,reasons:r}}
 function runPrecisionValidation(){const out=document.getElementById('precisionContent');if(out)out.textContent='در حال اجرای Precision Supervisor: replay → purged OOS → calibration → bootstrap CI → permutation → anomaly...';return Promise.resolve().then(async()=>{const symbol=els.symbol.value.trim().toUpperCase(),interval=els.interval.value,c=await fetchKlines(symbol,interval,1500,true);const replay=trueEngineReplayV11(c),oos=pPurgedWalkForward(c),cal=pCalibration(replay.tradesDetail),ci=pBootstrapCI(replay.tradesDetail),perm=pPermutationTest(replay.tradesDetail),anomaly=pAnomalyScan(c),reg=oos,gate=pPrecisionGate({replay,oos,cal,ci,perm,anomaly,reg});const data={symbol,interval,replay,oos,cal,ci,perm,anomaly,reg,gate,time:Date.now(),engine:'V25_PRECISION_SUPERVISOR'};PRECISION_STATE.validation=data;window.__PRECISION_VALIDATION=data;renderPrecision(data);return data}).catch(e=>{if(out)out.textContent='خطا در Precision Supervisor: '+e.message;return null})}
@@ -2640,3 +2643,32 @@ mReplaySignal=function(c){try{const htf=null,mtf=null,r=_ultimateBaseAnalyze(c,h
 // Add a final abstention layer to live analysis. It can only downgrade confidence; it never upgrades a signal to trade-ready.
 const _precisionRender=renderResult;
 renderResult=function(res,s,i,t){try{if(res&&!res.insufficient){const e=pEnsemble(res);res.precisionSupervisor=e;if(e.abstain&&(res.verdictClass==='v-buy'||res.verdictClass==='v-sell')){res.verdictClass='v-hold';res.verdict='🟡 ABSTAIN — عدم‌قطعیت/اختلاف شواهد بالا';res.entryState='ABSTAIN';res.risk=null;res.confidence=Math.min(mNum(res.confidence,0),49);res.notes=res.notes||[];res.notes.push('Precision Supervisor: برای جلوگیری از over-trading، سیگنال به‌دلیل عدم‌قطعیت abstain شد.')}}}catch(e){console.warn('Precision Supervisor live layer',e)}_precisionRender(res,s,i,t)};
+
+
+function renderDecisionDetailsV27(res){
+  const el=id=>document.getElementById(id);
+  if(!res || !el('v27Details')) return;
+  const val=x=>x==null||x===''?'—':String(x);
+  const dir=x=>x==='up'?'صعودی':x==='down'?'نزولی':x==='mixed'?'مختلط':x==='neutral'?'خنثی':val(x);
+  el('v27Trend').textContent=val(res.trend||res.trendBias||res.regime?.trend);
+  el('v27Structure').textContent=val(res.structure?.structure||res.marketStructure||res.structureBias);
+  el('v27HTF').textContent=dir(res.htfTrend);
+  el('v27Momentum').textContent=res.momScore==null?'—':`${res.momScore>0?'+':''}${res.momScore}`;
+  el('v27Volume').textContent=res.volScore==null?'—':`${res.volScore>0?'+':''}${res.volScore}`;
+  const s=res.supports?.[0]?.price, r=res.resistances?.[0]?.price;
+  el('v27SR').textContent=(s!=null||r!=null)?`حمایت: ${s!=null?Number(s).toFixed(4):'—'} | مقاومت: ${r!=null?Number(r).toFixed(4):'—'}`:'سطح معتبر کافی نیست';
+  let reasons=[];
+  if(Array.isArray(res.notes)) reasons.push(...res.notes);
+  if(Array.isArray(res.reasons)) reasons.push(...res.reasons);
+  if(res.structure?.structure) reasons.push(`ساختار: ${res.structure.structure}`);
+  if(res.wave?.strengthLabel) reasons.push(`قدرت موج: ${res.wave.strengthLabel}`);
+  if(res.breakoutQuality?.label) reasons.push(`کیفیت شکست: ${res.breakoutQuality.label}`);
+  if(res.regime?.label) reasons.push(`رژیم بازار: ${res.regime.label}`);
+  reasons=[...new Set(reasons.map(x=>String(x).trim()).filter(Boolean))].slice(0,6);
+  el('v27Reasons').innerHTML=reasons.length?reasons.map(x=>`<li>${x}</li>`).join(''):'<li>جزئیات بیشتری در خروجی فعلی ثبت نشده است.</li>';
+  const state=res.state||res.entryState||res.tradingState||'';
+  el('v27Status').textContent=state?`وضعیت ستاپ: ${state}`:'جزئیات تکمیلی';
+}
+
+// V28 research bridge: exposes read-only backtest functions to the standalone validation lab.
+window.__V28_ENGINE = { fetchKlines, trueEngineReplayV11, splitReplayV11, calibrationV12, parameterRobustnessV12, bootstrapV12, cscvStyleV12, pPurgedWalkForward, pCalibration, pBootstrapCI, pPermutationTest, pAnomalyScan, pPrecisionGate, MASTER_CFG, PRECISION_CFG };

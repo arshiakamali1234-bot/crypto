@@ -165,6 +165,22 @@
 .v27-note{color:var(--muted);font-size:11px;margin-top:7px}
 @media(max-width:600px){.v27-grid{grid-template-columns:1fr}}
 </style>
+
+<style>
+.position-grid{display:grid;grid-template-columns:1.3fr .8fr 1fr 1fr .7fr 1.2fr;gap:6px}
+.position-grid input,.position-grid select,.position-grid button{width:100%;min-width:0}
+.position-result{border:1px solid var(--border);border-radius:10px;background:#0d1218;padding:10px;margin-top:8px}
+.position-action{font-size:22px;font-weight:850;text-align:center;padding:10px;border-radius:9px;margin-bottom:8px}
+.position-action.hold{color:var(--green);background:rgba(49,196,157,.08);border:1px solid rgba(49,196,157,.28)}
+.position-action.reduce{color:var(--yellow);background:rgba(226,185,79,.08);border:1px solid rgba(226,185,79,.28)}
+.position-action.sell{color:var(--red);background:rgba(240,107,104,.08);border:1px solid rgba(240,107,104,.28)}
+.position-action.wait{color:#aeb7c2;background:rgba(141,152,166,.07);border:1px solid var(--border)}
+.position-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.position-metric{padding:7px;border:1px solid var(--border-soft);border-radius:8px}
+.position-metric b{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}
+.position-metric span{font-weight:750;font-size:12px}
+@media(max-width:700px){.position-grid{grid-template-columns:1fr 1fr}.position-grid button{grid-column:span 2}}
+</style>
 </head>
 <body>
 
@@ -220,6 +236,19 @@
       <br><br>
       <button id="saveSettings">ذخیره تنظیمات</button>
       <p class="muted">⚠ چون این یک سایت استاتیک روی گیت‌هاب است، هر کلیدی که اینجا وارد کنی مستقیماً از مرورگر خودت به سرور AI فراخوانی می‌شود. برای استفاده شخصی مشکلی ندارد؛ آن را با دیگران به اشتراک نگذار.</p>
+    </div>
+
+    <div class="card" id="positionCard">
+      <h3>📌 تحلیل پوزیشن / ستاپ من</h3>
+      <div class="position-grid">
+        <input id="positionSymbol" value="LINKUSDT" placeholder="نماد مثل LINKUSDT">
+        <select id="positionSide"><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select>
+        <input id="positionEntry" type="number" step="any" placeholder="قیمت ورود">
+        <input id="positionQty" type="number" step="any" placeholder="مقدار (اختیاری)">
+        <input id="positionLeverage" type="number" min="1" step="0.1" value="1" placeholder="اهرم">
+        <button id="positionAnalyzeBtn">تحلیل پوزیشن</button>
+      </div>
+      <div id="positionResult" class="muted" style="margin-top:8px">نماد، جهت و قیمت ورود را وارد کن؛ موتور وضعیت معامله را جدا از Market Scanner بررسی می‌کند.</div>
     </div>
 
     <div id="verdictBox" class="verdict v-none">داده‌ای بارگذاری نشده — نماد و تایم‌فریم را انتخاب و «بارگذاری و تحلیل» را بزن</div>
@@ -327,7 +356,7 @@
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
-<script src="app.js?v=ultimate-v25-20260909"></script><div id="v27Details" class="card v27-details">
+<script src="app.js?v=v31-position-100scan-20260909"></script><div id="v27Details" class="card v27-details">
 <h3>جزئیات تصمیم</h3>
 <div class="v27-grid">
 <div class="v27-item"><b>روند کلی</b><span id="v27Trend">—</span></div>

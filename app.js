@@ -164,10 +164,18 @@ async function drawAnalysisOnChart(res){
 async function fetchKlines(symbol, interval, limit=300, closedOnly=true){
   // یک کندل اضافه می‌گیریم تا اگر آخرین کندل هنوز بسته نشده، بعد از حذفش هم به تعداد limit کندلِ بسته‌شده برسیم
   const fetchLimit = closedOnly ? Math.min(limit+1, 1000) : limit;
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${fetchLimit}`;
-  const res = await fetch(url);
-  if(!res.ok){ let msg='عدم دسترسی به داده بازار برای این نماد/تایم‌فریم'; try{const er=await res.json(); if(er?.msg) msg += ' — '+er.msg;}catch(_){} throw new Error(msg); }
-  const raw = await res.json();
+  const hosts = ['https://api.binance.com','https://data-api.binance.vision'];
+  let raw=null, lastErr=null;
+  for(const host of hosts){
+    try{
+      const url = `${host}/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${interval}&limit=${fetchLimit}`;
+      const res = await fetch(url, {cache:'no-store'});
+      if(!res.ok) throw new Error('HTTP '+res.status);
+      raw = await res.json();
+      if(Array.isArray(raw) && raw.length) break;
+    }catch(e){ lastErr=e; }
+  }
+  if(!Array.isArray(raw) || !raw.length) throw new Error('عدم دسترسی به داده Binance؛ '+(lastErr?.message||'unknown'));
   let mapped = raw.map(k => ({
     time:k[0], closeTime:k[6], open:+k[1], high:+k[2], low:+k[3], close:+k[4], volume:+k[5]
   }));
@@ -2672,3 +2680,131 @@ function renderDecisionDetailsV27(res){
 
 // V28 research bridge: exposes read-only backtest functions to the standalone validation lab.
 window.__V28_ENGINE = { fetchKlines, trueEngineReplayV11, splitReplayV11, calibrationV12, parameterRobustnessV12, bootstrapV12, cscvStyleV12, pPurgedWalkForward, pCalibration, pBootstrapCI, pPermutationTest, pAnomalyScan, pPrecisionGate, MASTER_CFG, PRECISION_CFG };
+
+/* =========================================================
+   V31 POSITION / SETUP ANALYZER + 100-LIQUIDITY SCANNER
+   - Position decisions are intentionally separate from new-entry scanning.
+   - Scanner universe expanded to top 100 liquid USDT pairs.
+   - Deep analysis remains selective after a fast 1H pre-filter.
+   ========================================================= */
+(function V31PositionAndScanner(){
+  const pEls={
+    card:document.getElementById('positionCard'), symbol:document.getElementById('positionSymbol'),
+    side:document.getElementById('positionSide'), entry:document.getElementById('positionEntry'),
+    qty:document.getElementById('positionQty'), lev:document.getElementById('positionLeverage'),
+    btn:document.getElementById('positionAnalyzeBtn'), out:document.getElementById('positionResult')
+  };
+  if(!pEls.btn) return;
+
+  function nearestLevels(res, price){
+    const supports=(res?.supports||[]).map(x=>finiteNumber(x.price)).filter(Number.isFinite).filter(x=>x<price).sort((a,b)=>b-a);
+    const resistances=(res?.resistances||[]).map(x=>finiteNumber(x.price)).filter(Number.isFinite).filter(x=>x>price).sort((a,b)=>a-b);
+    return {support:supports[0]??null, support2:supports[1]??null, resistance:resistances[0]??null, resistance2:resistances[1]??null};
+  }
+  function reversalRisk(res, side, price, levels){
+    const long=side==='LONG'; let risk=25; const reasons=[];
+    const div=res?.divergence||{};
+    const divText=JSON.stringify(div);
+    if(long && /bear/i.test(divText)){risk+=18;reasons.push('واگرایی/فشار نزولی');}
+    if(!long && /bull/i.test(divText)){risk+=18;reasons.push('واگرایی/فشار صعودی');}
+    const st=String(res?.structure?.structure||res?.advancedStructure?.structure||'');
+    if(long && /(نزولی|LH|LL)/i.test(st)){risk+=20;reasons.push('ساختار خلاف LONG');}
+    if(!long && /(صعودی|HH|HL)/i.test(st)){risk+=20;reasons.push('ساختار خلاف SHORT');}
+    const atr=finiteNumber(res?.atrVal)||0;
+    if(atr>0){
+      const level=long?levels.resistance:levels.support;
+      if(level!=null && Math.abs(level-price)<=atr*0.7){risk+=15;reasons.push(long?'نزدیکی به مقاومت':'نزدیکی به حمایت');}
+    }
+    const wave=res?.waveEngine;
+    if(wave){
+      const pressure=long?wave.bullishPressure:wave.bearishPressure;
+      if(pressure<42){risk+=12;reasons.push('فشار موج ضعیف');}
+    }
+    return {score:Math.max(0,Math.min(100,Math.round(risk))),reasons};
+  }
+  function positionAction(side, pnlPct, reversal, res, entry, current){
+    const long=side==='LONG';
+    const st=String(res?.advancedStructure?.structure||res?.structure?.structure||'');
+    const structureAgainst=long ? /(نزولی|LH|LL)/i.test(st) : /(صعودی|HH|HL)/i.test(st);
+    const invalid=long ? current < (res?.supports?.[0]?.price||-Infinity) : current > (res?.resistances?.[0]?.price||Infinity);
+    if(invalid || (reversal>=75 && structureAgainst)) return {key:'sell',label:'SELL',reason:'Thesis ورود ضعیف/باطل شده؛ ساختار و ریسک برگشت هم‌زمان علیه پوزیشن هستند.'};
+    if(reversal>=70 || structureAgainst) return {key:'reduce',label:'REDUCE',reason:'ریسک برگشت بالا رفته یا ساختار در حال تضعیف است؛ نگهداری کامل پوزیشن دیگر کیفیت قبلی را ندارد.'};
+    if(pnlPct<0 && reversal<55) return {key:'hold',label:'HOLD',reason:'ضرر فعلی به‌تنهایی دلیل خروج نیست؛ Thesis هنوز به‌طور کامل باطل نشده است.'};
+    if(pnlPct>=0 && reversal<65) return {key:'hold',label:'HOLD',reason:'روند/ساختار هنوز از ادامه حرکت حمایت می‌کند و Thesis ورود معتبر مانده است.'};
+    return {key:'wait',label:'WAIT',reason:'شواهد متناقض است؛ فعلاً تصمیم جدیدی به معامله تحمیل نکن.'};
+  }
+  async function analyzePosition(){
+    const symbol=(pEls.symbol.value||'').trim().toUpperCase(); const side=pEls.side.value;
+    const entry=finiteNumber(pEls.entry.value); const qty=Math.max(finiteNumber(pEls.qty.value)||0,0); const lev=Math.max(finiteNumber(pEls.lev.value)||1,1);
+    if(!symbol || entry==null || entry<=0){pEls.out.innerHTML='<div class="muted">نماد و قیمت ورود معتبر لازم است.</div>';return;}
+    pEls.out.innerHTML='<div class="loading">در حال تحلیل پوزیشن با دادهٔ بسته‌شدهٔ Binance + چارت...</div>';
+    try{
+      renderTVWidget(symbol,els.interval.value);
+      const interval=els.interval.value;
+      const [candles,htf,mtf]=await Promise.all([fetchKlines(symbol,interval,300,true),(async()=>{const tf=HTF_MAP[interval];return tf?fetchKlines(symbol,tf,220,true):null})(),buildCompactMTF(symbol,interval)]);
+      let res=analyze(candles,htf,mtf);
+      if(res.insufficient){pEls.out.innerHTML='<div class="muted">دادهٔ کافی/معتبر برای تحلیل این پوزیشن وجود ندارد.</div>';return;}
+      res=await enrichCryptoDerivatives(res,symbol,interval); res=applyProTraderLayer(res,candles,symbol,interval); res=applyTrustGate(res,candles,symbol,interval);
+      const current=candles.at(-1).close, pnlPerUnit=side==='LONG'?current-entry:entry-current, pnlPct=(pnlPerUnit/entry)*100, pnlValue=qty?pnlPerUnit*qty:null;
+      const levels=nearestLevels(res,current); const rev=reversalRisk(res,side,current,levels); const act=positionAction(side,pnlPct,rev.score,res,entry,current);
+      const distanceToSupport=levels.support!=null?((current-levels.support)/current*100):null;
+      const distanceToResistance=levels.resistance!=null?((levels.resistance-current)/current*100):null;
+      const thesisOk=act.key!=='sell';
+      const riskClass=rev.score>=70?'tag-down':rev.score>=50?'tag-neu':'tag-up';
+      pEls.out.innerHTML=`<div class="position-result">
+        <div class="position-action ${act.key}">${act.label}</div>
+        <div class="muted" style="margin-bottom:8px">${escapeHTML(act.reason)}</div>
+        <div class="position-metrics">
+          <div class="position-metric"><b>قیمت فعلی</b><span>${fmt(current)}</span></div>
+          <div class="position-metric"><b>PnL</b><span>${pnlPct>=0?'+':''}${pnlPct.toFixed(2)}%${pnlValue!=null?' · '+(pnlValue>=0?'+':'')+pnlValue.toFixed(2)+' USDT':''}</span></div>
+          <div class="position-metric"><b>ریسک برگشت</b><span class="tag ${riskClass}">${rev.score}/100</span></div>
+          <div class="position-metric"><b>Thesis ورود</b><span>${thesisOk?'🟢 هنوز معتبر':'🔴 تضعیف/باطل'}</span></div>
+          <div class="position-metric"><b>حمایت نزدیک</b><span>${fmt(levels.support)}${distanceToSupport!=null?' · '+distanceToSupport.toFixed(2)+'%':''}</span></div>
+          <div class="position-metric"><b>مقاومت نزدیک</b><span>${fmt(levels.resistance)}${distanceToResistance!=null?' · '+distanceToResistance.toFixed(2)+'%':''}</span></div>
+          <div class="position-metric"><b>ساختار</b><span>${escapeHTML(res.advancedStructure?.structure||res.structure?.structure||'—')}</span></div>
+          <div class="position-metric"><b>Entry / Leverage</b><span>${fmt(entry)} · ${lev}x</span></div>
+        </div>
+        <div class="pro-block" style="margin-top:8px"><b>دلایل ریسک برگشت:</b> ${rev.reasons.length?rev.reasons.map(escapeHTML).join(' • '):'شاهد قوی برای برگشت فعلاً دیده نشد.'}</div>
+        <div class="pro-block" style="margin-top:8px"><b>نکته:</b> «ریسک برگشت» امتیاز مدل است، نه احتمال آماری تضمین‌شده. تصمیم این بخش مستقل از Market Scanner است؛ ممکن است Scanner ورود جدید را مناسب نداند ولی برای پوزیشن باز HOLD بدهد.</div>
+      </div>`;
+      drawAnalysisOnChart(res);
+    }catch(e){pEls.out.innerHTML=`<div class="muted">خطا در تحلیل پوزیشن: ${escapeHTML(e.message)}</div>`;}
+  }
+  pEls.btn.onclick=analyzePosition;
+  pEls.symbol.addEventListener('change',()=>{if(pEls.symbol.value.trim()) els.symbol.value=pEls.symbol.value.trim().toUpperCase();});
+
+  // Replace the scanner with a 100-symbol universe and bounded deep-analysis fan-out.
+  const oldFetchTop=fetchTop24hTickers;
+  window.fetchTop24hTickersV31=async function(limit=100){ return oldFetchTop(100); };
+  window.runMarketScanV31=async function(){
+    els.scannerOverlay.style.display='block';
+    els.scannerBody.innerHTML='<div class="loading">در حال دریافت ۱۰۰ جفت‌ارز USDT با بیشترین حجم و نقدشوندگی...</div>';
+    try{
+      const btc=await getBTCBias();
+      const tickers=await window.fetchTop24hTickersV31(100);
+      els.scannerBody.innerHTML=`<div class="loading">بایاس BTC: ${btc.bias} — غربال سریع ${tickers.length} بازار با ۱H...</div>`;
+      const filtered=[];
+      for(let i=0;i<tickers.length;i+=12){ filtered.push(...await quickFilterCandidates(tickers.slice(i,i+12))); }
+      const sortedUp=[...filtered].sort((a,b)=>b.momentum-a.momentum).slice(0,12);
+      const sortedDown=[...filtered].sort((a,b)=>a.momentum-b.momentum).slice(0,12);
+      const candidateSymbols=[...new Set([...sortedUp,...sortedDown].map(x=>x.symbol))];
+      els.scannerBody.innerHTML=`<div class="loading">بایاس BTC: ${btc.bias} — تحلیل عمیق ${candidateSymbols.length} کاندیدای برتر از ${tickers.length} بازار...</div>`;
+      let deep=[];
+      for(let i=0;i<candidateSymbols.length;i+=4){ deep.push(...(await Promise.all(candidateSymbols.slice(i,i+4).map(s=>deepAnalyzeSymbol(s)))).filter(Boolean)); }
+      deep=applySignalStability(deep,'scan');
+      const rankScore=d=>(d.setupQuality||0)*.55+(d.entryReadiness||0)*.30+Math.max(0,d.confidence||0)*.15+(d.stableRank?4:0);
+      const longs=deep.filter(d=>d.verdictClass==='v-buy').sort((a,b)=>rankScore(b)-rankScore(a)).slice(0,5);
+      const shorts=deep.filter(d=>d.verdictClass==='v-sell').sort((a,b)=>rankScore(b)-rankScore(a)).slice(0,5);
+      const used=new Set([...longs,...shorts].map(x=>x.symbol));
+      const watch=deep.filter(d=>!used.has(d.symbol)&&(d.watchLong||d.watchShort)).sort((a,b)=>rankScore(b)-rankScore(a)).slice(0,8);
+      let html=`<div class="row" style="border:none"><span>بازار بررسی‌شده</span><span>${tickers.length} جفت‌ارز USDT</span></div><div class="row"><span>کاندیدهای تحلیل عمیق</span><span>${candidateSymbols.length}</span></div><div class="row"><span>BTC Bias</span><span>${btc.bias}</span></div>`;
+      html+='<h3>🟢 بهترین LONGها</h3>'+ (longs.length?longs.map(x=>scannerCardHTML(x,'long')).join(''):'<p class="muted">هیچ LONG قاطعی پیدا نشد.</p>');
+      html+='<h3>🔴 بهترین SHORTها</h3>'+ (shorts.length?shorts.map(x=>scannerCardHTML(x,'short')).join(''):'<p class="muted">هیچ SHORT قاطعی پیدا نشد.</p>');
+      html+='<h3>🟡 بهترین Watchlistها</h3>'+ (watch.length?watch.map(x=>scannerCardHTML(x,'watch')).join(''):'<p class="muted">مورد قابل‌توجهی در واچ‌لیست پیدا نشد.</p>');
+      if(!longs.length&&!shorts.length) html+=`<p class="muted">⚪ NO TRADE — افزایش Universe به ۱۰۰ نماد هم الزاماً به معنی وجود ستاپ معتبر نیست؛ کیفیت ورود بر تعداد سیگنال اولویت دارد.</p>`;
+      html+='<p class="muted" style="margin-top:10px">⚠ غربال اولیه روی ۱۰۰ نماد انجام شد؛ تحلیل عمیق فقط روی کاندیدهای برتر ادامه یافت تا فشار درخواست‌های Binance کنترل شود.</p>';
+      els.scannerBody.innerHTML=html;
+    }catch(e){els.scannerBody.innerHTML=`<p class="muted">خطا در اسکن بازار: ${escapeHTML(e.message)}</p>`;}
+  };
+  els.scanBtn.onclick=window.runMarketScanV31;
+})();
